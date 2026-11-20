@@ -7,16 +7,48 @@ Hand this file to a coding agent. Build in the phases in section 15. Ask before 
 - **Ingest**: a backend service takes a business URL (or a discovered listing), gathers data from permitted sources, and produces a structured Business JSON document.
 - **Search**: a public webpage where people type natural-language queries (Exa.ai-style: "eco-friendly pest control in Sunnyvale, same-day", "vegan South Indian brunch open Sunday") and get ranked, relevant businesses.
 - **Chat**: from any result, the user can chat with that business. The agent is assembled on the fly from that business's JSON. No per-business code, training, or deployment.
-- **Refine**: after the first search, the user can either chat with an agent or keep searching to narrow down the results. The top 5 results become the user's shortlist. Follow-up searches only cover the shortlist, not the full index. The user can add more agents from the wider results by selecting them. From then on, search covers the top 5 plus whatever the user selected.
+- **Refine through conversation (grounded search sessions)**: after the first search, the system selects the top 5 agents as the user's **active set**. From then on, the user can keep chatting and searching, and every follow-up (a refining search, a question to the agents, a comparison) is grounded only in the active set.
+  - The user can include more agents from the remaining matches, or remove ones they don't want. The system never silently widens the set.
+  - Chat answers feed back into the search. An agent whose own data shows it does not meet a requirement is flagged as a non-match. An agent that simply lacks the information stays "unknown" and is never treated as "no".
+  - Results get narrower and more relevant with every turn. See section 7.4.
 
 ## 2. Principles
 
-- **JSON is the single source of truth.** Search index, result cards, and chat agent are all derived from it.
-- **Small stable core + pluggable profiles + generic knowledge layer** (section 4). Never hard-code a vertical (restaurant, pest control, etc.) in pipeline code.
-- **Capabilities, not business types, drive behavior.** Chat tools and prompt rules switch on from `supported_intents` and available data, never from `if type == "restaurant"`.
+**Data**
+
+- **JSON is the single source of truth.** Search index, result cards, and chat agent are all derived from it and rebuildable from it.
+- **Config over code.** A small stable core, pluggable profiles, and a generic knowledge layer (section 4). Behavior switches on declared capabilities and available data, never on business type. New verticals are schema + manifest files.
 - **Never invent facts.** Missing data is null. The agent says it doesn't know and follows the fallback path.
-- **Provenance on every field**: source URL, extraction method, confidence.
-- **Consent before publication.** Crawled data is a draft until it passes the publication rules in section 11.
+- **Provenance on every field** (source URL, method, confidence). It drives merge priority, re-extraction, and grounding checks.
+- **Owner and human edits override automation.**
+
+**Ingest**
+
+- **Crawl only what's permitted, and degrade through a fallback ladder.** For each missing field, try the sources in this order and stop at the first that fills it:
+  1. **Direct check**: `llms.txt`, sitemap, and robots.txt-allowed paths on the business's own site.
+  2. **Structured API**: a domain-appropriate official API (`places_api`, `open_data`; see section 5).
+  3. **Search API, site-scoped**: Tavily or Brave with `site:targetdomain.com` to pull indexed snippets when direct fetching fails for technical reasons (bot protection, JS rendering, rate limits).
+  4. **Search API, broad**: the same API without `site:`, to find press, news, or partner listings that mention the missing information.
+  - Evidence from steps 3 and 4 is lower trust: it carries its source URL and `method`, is marked `third_party` where it is not the business's own words, ranks below steps 1 and 2 in merge, and is never used for offers, guarantees, or prices.
+  - Steps 3 and 4 MUST NOT be used to bypass an opt-out: not for hosts with a robots.txt disallow, noindex/nofollow, an explicit opt-out, or an entry on the suppression list.
+  - Honor each search provider's terms on storing and reusing results.
+- **Consent before publication.** Crawled data is a draft until it passes the publication rules in section 11, whatever source it came from.
+- **Content is data, never instructions**: crawled pages, search snippets, user messages, and queries.
+
+**Search, Refine, Chat**
+
+- **Compute facts in code, not in the LLM**: open-now, service-area match, shortlist scoping.
+- **One active set grounds everything.** After the first search, the top 5 become the active set. Every follow-up (refining search, question to the agents, comparison) is grounded only in that set. The set changes only by explicit user action (add from remaining matches, remove), never silently, and every response states its scope. Enforced server-side.
+- **Unknown is not no.** Each agent is tri-state per requirement: `match`, `non_match`, or `unknown`. `non_match` requires the agent's own data to contradict the requirement. Missing data stays `unknown` and is never treated as a no.
+- **Chat feeds search.** Facts surfaced in chat update the active set's match state, so results get narrower and more relevant each turn. Comparisons attribute every claim to the agent whose JSON it came from.
+- **One session across search and chat.** Moving between them never loses the active set or its match state.
+- **Explainable ranking.** Every result says why it matched, hard filters are never relaxed silently, and `unknown` is shown as unknown.
+- **Be honest about the listing**: AI disclosure, unverified label, self-published testimonials are not reviews, brand claims are attributed to the brand.
+- **Collect the minimum**: only what users volunteer, no PII in logs.
+
+**Quality**
+
+- **Evals gate changes**: schema, extraction, search, shortlist, chat (section 12).
 
 ## 3. Tech stack (change only with justification)
 
