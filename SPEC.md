@@ -57,13 +57,15 @@ Hand this file to a coding agent. Build in the phases in section 15. Ask before 
 |---|---|
 | Backend | Python 3.12, FastAPI, Pydantic v2 |
 | Crawling | httpx for static pages, Playwright for JS-rendered pages, trafilatura for main-content extraction |
-| Queue/workers | Redis + RQ or Celery |
+| Durable execution | Temporal, self-hosted open source, Python SDK (`temporalio`). Replaces the queue (section 6.5) |
+| Cache / rate limits | Redis, for caches (query understanding, compiled agent JSON) and per-IP/session rate limits only. Not a queue |
+| Object storage | S3-compatible (MinIO in dev) for raw page snapshots |
 | Database | PostgreSQL 16 + pgvector + pg_trgm; Business JSON in JSONB |
 | Schemas | JSON Schema files in `/schemas`, loaded at startup, validated with `jsonschema` |
 | Embeddings / LLM | Provider-agnostic interfaces; default Claude for extraction and chat; a small, cheap model for query understanding and routing |
 | Search API (ingest fallback) | Provider-agnostic interface; default Exa Search API, Tavily as an alternative (section 5.1) |
 | Frontend | Next.js (App Router) + TypeScript + Tailwind, SSE streaming chat |
-| Infra | Docker Compose for dev; env-based config; structured JSON logs |
+| Infra | Docker Compose for dev (app, Postgres, Redis, MinIO, Temporal server + UI, a separate Postgres database for Temporal, workers); env-based config; structured JSON logs; OpenTelemetry traces |
 
 ## 4. Data model: core + profile + knowledge
 
@@ -151,7 +153,7 @@ Ingestion is a set of adapters writing into the same pipeline. Each adapter retu
 | `search_api` | Exa Search API (default) or Tavily, in `site` mode (domain-restricted) or `broad` mode | Fallback only (section 5.1). Lower trust; provider terms apply |
 
 - MUST NOT scrape Google Search, Maps, or Local Services result pages, or any site whose terms or robots.txt disallow automated access. If a submitted URL is an aggregator or results page (multiple businesses), the service returns an error explaining this and suggests discovery via `places_api` or submitting each business's own website.
-- **Discovery**: `POST /v1/discover { "query": "pest control", "location": "Sunnyvale, CA" }` uses `places_api` to list candidate businesses, then queues website ingest for each candidate's own site.
+- **Discovery**: `POST /v1/discover { "query": "pest control", "location": "Sunnyvale, CA" }` uses `places_api` to list candidate businesses, then starts a child ingest workflow (section 6.5) for each candidate's own site.
 - **Merge priority**: admin/owner (admin only in v1) > structured data on the business's own site (JSON-LD) > site text > `places_api` > `open_data` > `search_api` (site mode) > `search_api` (broad mode) > LLM inference. Conflicts are recorded in `system.warnings`.
 
 ### 5.1 Fallback ladder
@@ -180,9 +182,9 @@ Rules:
 
 ### 6.1 API
 
-- `POST /v1/ingest { "url": "...", "options": { "max_pages": 15, "force_refresh": false } }` returns `202 { "job_id", "business_id" }`
-- `GET /v1/ingest/{job_id}`: status (`queued | crawling | classifying | extracting | enriching | validating | indexed | failed`; `enriching` is the fallback ladder, section 5.1), stage timings, warnings
-- `GET /v1/businesses/{business_id}`, `POST /v1/businesses/{business_id}/refresh`
+- `POST /v1/ingest { "url": "...", "options": { "max_pages": 15, "force_refresh": false } }` starts an ingest workflow (section 6.5) and returns `202 { "job_id", "business_id" }`. `job_id` is the workflow ID
+- `GET /v1/ingest/{job_id}`: read from the workflow state (section 6.5): status (`queued | crawling | classifying | extracting | enriching | validating | indexed | failed`; `enriching` is the fallback ladder, section 5.1), stage timings, warnings
+- `GET /v1/businesses/{business_id}`, `POST /v1/businesses/{business_id}/refresh` (starts a refresh workflow)
 - `PATCH /v1/businesses/{business_id}`: admin edits (authenticated); sets `verification_status = "verified"`. Owner edits are post-v1
 
 ### 6.2 Crawl behavior
@@ -213,6 +215,27 @@ Rules:
 - Hours to `hours_structured` in the business's timezone when hours exist.
 - **Freshness policy**: each time-sensitive field has a max age (defaults: hours 30 days, offers 14 days, prices 14 days; configurable). Past the max age the field is *stale*: the agent hedges it ("as of {date}, please confirm by phone"), ranking penalizes it, and the refresh scheduler prioritizes it.
 - Categories mapped to a controlled taxonomy with aliases (`/schemas/taxonomy/categories.json`).
+
+### 6.5 Durable execution (Temporal)
+
+Temporal runs every long-lived, multi-step, retry-prone job. It does not run the request path.
+
+**In Temporal:** the ingest pipeline (crawl, classify, extract, enrich, validate, index), each fallback-ladder step (section 5.1), `/discover` fan-out (a parent workflow starts one child ingest workflow per candidate), re-extraction after a profile change, lazy-migration backfills, the refresh scheduler (Temporal Schedules, every 14 days or on demand, stale time-sensitive fields first), takedown, and lead delivery retries.
+
+**Not in Temporal:** search, single-business chat, and fan-out chat (sections 7 and 8). They are latency-bound and stream over SSE, so they stay in FastAPI.
+
+Rules:
+- **No I/O in workflow code.** HTTP, LLM, database, and search-provider calls are activities. Workflow code is deterministic. Activities set timeouts and retry policies, and long crawls heartbeat.
+- **Stage mapping.** The ingest job statuses in 6.1 map one-to-one to workflow stages.
+- **Small payloads.** Workflows pass references (`business_id`, page IDs, object-storage keys), never raw HTML or full documents. This keeps PII and business data out of workflow history.
+- **Workflow ID is the dedupe key.** `ingest-{host}-{phone_norm}` (section 4.4) with a reuse policy that rejects a concurrent duplicate. `force_refresh` starts a new run.
+- **First activity is the opt-out check.** It checks the suppression list and the host's opt-out signals (section 11) before any crawl or search-provider call. A suppressed host ends the workflow there.
+- **Politeness in the workflow layer.** robots.txt crawl-delay and per-host rate limits are enforced by the orchestration, not by worker concurrency.
+- **Separate task queues.** Playwright crawling runs on its own browser task queue and workers, so heavy rendering cannot starve LLM or API activities.
+- **Ladder activities enforce section 5.1.** A ladder activity rejects any provider request that could live-fetch the target (for Exa, any live-crawl parameter).
+- **Idempotent activities.** Every activity is safe to retry. Writes use upserts keyed by `business_id` and field path.
+- **Status reads.** `GET /v1/ingest/{job_id}` reads workflow queries or a database projection (`ingest_jobs`), including stage timings and warnings.
+- **Versioning.** Use Temporal patching or worker versioning, since workflows can span days when retries or schedules apply.
 
 ## 7. Search (Exa-inspired)
 
@@ -388,7 +411,10 @@ With an active set, the panel offers one tab per agent plus an "Ask all" tab. An
 - `suppression_list(host PK, reason, created_at)`
 - `search_sessions(session_id PK, active_set JSONB (business_ids: auto top 5 + user_added), requirements JSONB, match_state JSONB, scope, created_at, updated_at)`
 - `chat_sessions(session_id PK, search_session_id, created_at)`, `chat_messages(… target_business_id)`
-- `ingest_jobs`, `leads(… delivered BOOL)`, `takedowns` (`claims` post-v1)
+- `ingest_jobs(job_id = workflow_id, business_id, status, stage_timings, warnings, started_at, finished_at)`: a projection of workflow state for the status API
+- `leads(… delivered BOOL)`, `takedowns` (`claims` post-v1)
+
+Raw HTML and cleaned text live in object storage (`crawl_pages.raw_path` is an object key). Temporal keeps its own state in a separate Postgres database, never in the app database.
 
 Indexes: GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, B-tree on `(host, phone_norm)`.
 
@@ -410,13 +436,26 @@ Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and
 - Before any ingest step, including the fallback ladder, check the suppression list and the host's opt-out signals (section 5.1).
 - Store per-source licenses, Places API data, and search-provider results only as their terms allow. Keep an audit log of what came from which source and ladder step.
 - **SSRF protection (MUST)**: block private, loopback, link-local, and cloud-metadata IPs; re-check after redirects; limit size and time; http/https only.
-- Auth on admin endpoints; secrets via environment; no PII in logs; log LLM calls with `business_id`, token counts, latency.
+- **Takedown runs as a workflow** (section 6.5): delete the record, embeddings, raw pages, chat history, and any ingest-job rows, add the host to the suppression list, and retry each step until it succeeds. Because workflows carry references rather than business data, histories hold nothing to purge; set a finite history retention anyway.
+- SSRF checks (below) run inside every crawl activity, including after redirects.
+- Auth on admin endpoints and on the Temporal UI (never exposed publicly); secrets via environment; no PII in logs; log LLM calls with `business_id`, token counts, latency.
 
 ## 12. Testing and evaluation
 
 - **Schema fixtures**: every profile ships with 3+ example JSON fixtures (including a sparse one with mostly nulls and tri-state booleans left null). CI validates them against core + profile and runs migrations on old fixtures.
 - **Extraction evals**: a golden set of 30+ real sites across at least 4 verticals (include a restaurant, a service-area business, a franchise subdomain, and a thin one-page site), with hand-labeled JSON. Report per-field precision/recall and profile-classification accuracy. Verify absent data stays null and is never `false`. Gate merges on no regression.
 - **Fallback-ladder evals**: simulated blocked sites (bot protection, JS wall, rate limit). Verify the ladder order, the stop-at-sufficient-confidence rule, `ladder_step` and `origin: third_party` on search evidence, and that search-derived values are never accepted for offers, guarantees, or prices. Verify hosts with an opt-out signal or on the suppression list make zero search-provider calls. Verify the pipeline sends no spoofed headers, and that every ladder call, whichever provider, avoids live-fetching the target (for Exa, cache-only with no live crawl parameters).
+- **Durable-execution evals** (Temporal, section 6.5):
+  - Kill a worker mid-ingest: the workflow resumes and finishes, with no duplicated writes.
+  - A flaky activity (LLM, search provider, network) retries per its policy and succeeds, and a permanently failing one ends the job as `failed` with details.
+  - A duplicate concurrent ingest for the same `{host, phone_norm}` is rejected.
+  - Replaying recorded workflow histories against new code passes (determinism); a version change does not break in-flight workflows.
+  - A suppressed or opted-out host ends at the first activity with no crawl and no search-provider call.
+  - Per-host crawl-delay and rate limits hold under parallel `/discover` fan-out.
+  - Workflow histories contain references only: no raw HTML, page text, or contact details.
+  - Takedown, killed partway, resumes and completes every step, and ends with the host on the suppression list.
+  - The refresh Schedule triggers on time, and does not overlap a running refresh of the same business.
+  - The browser task queue under load does not delay LLM or API activities.
 - **Generalization test**: add a brand-new profile (e.g. salon) using only schema + manifest files, then verify ingest, search, and chat work with zero code changes. This test MUST pass before Phase 1 is considered done.
 - **Search evals**: 50+ labeled queries including service-area ("near me" for a business with no address). Report nDCG@10 and recall@30 for vector-only vs hybrid vs hybrid+rerank. Include hard-filter queries over businesses with null data: they must stay in results as `unknown`, flagged, and never be dropped or silently relaxed.
 - **Active-set evals**: multi-turn sessions.
@@ -450,25 +489,30 @@ Payments, real booking integrations, voice, multi-language (schema supports it, 
   /ingest     adapters/ (website, places_api, open_data, search_api), ladder.py, crawler.py, cleaner.py, classifier.py, extractor.py, merger.py, normalizer.py, freshness.py
   /search     indexer.py, query_understanding.py, retrieve.py, rerank.py, location.py, session.py (active set), match_state.py
   /chat       prompt.py, registry.py, tools.py, runtime.py, guardrails.py, router.py, fanout.py
+  /workflows  ingest.py, discover.py, refresh.py (Schedules), reextract.py, takedown.py, lead_delivery.py
+  /activities crawl.py, classify.py, extract.py, ladder.py, validate.py, index.py, optout_check.py
+  /worker     main.py (task queues: default, browser)
   /api        ingest.py, search.py, chat.py, admin.py
   /models     loaded dynamically from /schemas
 /evals        extraction/, ladder/, search/, active_set/, match_state/, chat/, fanout/, generalization/
 /frontend     Next.js app
-docker-compose.yml, README.md
+docker-compose.yml   (app, workers, Postgres, Temporal Postgres, Temporal server + UI, Redis, MinIO)
+README.md
 ```
 
 ## 15. Delivery phases
 
-- **Phase 1: Schemas + ingest.** Core and the three initial profiles, schema loader, website adapter, fallback ladder (steps 1, 3, 4 with `search_api`), classifier, extractor, merger, normalizer, freshness policy, storage, CLI `ingest <url>`, fixture tests, extraction and ladder evals, and the generalization test (new salon profile with zero code changes). Done when: 10 sites across at least 3 verticals produce valid JSON with provenance, the ladder evals pass, and the generalization test passes.
+- **Phase 1: Schemas + ingest.** Temporal setup (server, workers, default and browser task queues), the ingest workflow and activities, core and the three initial profiles, schema loader, website adapter, fallback ladder (steps 1, 3, 4 with `search_api`), classifier, extractor, merger, normalizer, freshness policy, storage, CLI `ingest <url>` (starts a workflow), fixture tests, extraction and ladder evals, and the generalization test (new salon profile with zero code changes). Done when: 10 sites across at least 3 verticals produce valid JSON with provenance, an ingest survives a worker restart mid-run and resumes, a duplicate concurrent ingest is rejected, the ladder evals pass, and the generalization test passes.
 - **Phase 2: Chat.** Prompt compiler, capability registry, tools, SSE API for single-business chat, minimal chat page, chat evals. Done when: grounded answers, refusal on unknowns, no commitments or negatives from silence, correct tool gating across all test businesses.
 - **Phase 3: Search + active set.** Indexer, hybrid retrieval with service-area matching, query understanding with requirements, four-state hard-requirement evaluation, reranker, API, UI, search sessions with the active set and its endpoints. Done when: search evals and active-set evals meet section 12 targets.
 - **Phase 4: Refine through conversation.** Match state (section 7.4), chat-to-search feedback, router, fan-out, comparison, multi-agent chat UI, match-state and fan-out evals. Done when: the evals for match state and fan-out pass, including zero leakage and no silent widening.
-- **Phase 5: Discovery, compliance.** Places API adapter (ladder step 2) + `/discover`, publication states, takedown, suppression list, leads delivery, auth, rate limits, SSRF tests, refresh scheduler (every 14 days or on demand, stale time-sensitive fields first), observability.
+- **Phase 5: Discovery, compliance.** Places API adapter (ladder step 2) + `/discover`, publication states, takedown workflow, suppression list, lead delivery workflow, discovery workflow, auth, rate limits, SSRF tests, refresh Schedules (every 14 days or on demand, stale time-sensitive fields first), observability.
 
 ## 16. Questions to confirm before starting
 
 - LLM and embedding providers and keys available? Which small model for routing?
-- Hosting target?
+- Hosting target? Where does production Temporal run (Docker Compose only, or Kubernetes with the Helm chart), and which Postgres instance backs it?
+- Temporal namespace, history retention, and worker concurrency limits (especially the browser task queue)?
 - Geocoder (Google, Mapbox, Nominatim)?
 - Google Places API access and its current storage/caching terms: which fields may be persisted?
 - Exa Search API key and plan: which terms apply to storing and reusing results, and is cache-only retrieval available on it?
