@@ -76,19 +76,25 @@ Every Business document has three layers. Only layer 1 is fixed.
 Fields every business has. Search, cards, and the chat shell depend only on these. Defined in `/schemas/core@<version>.json`. Summary:
 
 - `schema_version`, `business_id`, `parent_brand` (nullable; see 4.4)
-- `identity`: `dba_name`, `tagline`, `categories[]`, `brand_voice`
-- `location`: `is_service_area_business`, `address` (nullable), `geo` (nullable), `service_area` (nullable: `primary_locale`, `cities[]`, `postal_codes[]`, `radius_km`, `regions_stated[]`), `parking_and_access`
-- `contact`: `phone` (E.164), `website`, `contact_form`, `escalation_contact` (nullable)
-- `operations`: `timezone`, `hours` (nullable display strings), `hours_structured` (nullable), `price_tier` (nullable), `payment_methods` (nullable), `key_attributes[]`
-- `capabilities_and_actions`: `supported_intents[]`, `external_links{}`
+- `identity`: `dba_name`, `tagline`, `description` (nullable, plain text), `categories[]` (taxonomy ids; the first is primary and drives facets), `brand_voice`, `media` (nullable: `logo_url`, `cover_image_url`, `image_urls[]`; URLs only, rights stay with the business)
+- `location`: `presence` (`storefront` | `service_area` | `online` | `hybrid`), `label` (nullable; for example a store name or number that distinguishes sibling locations), `address` (nullable), `geo` (nullable), `service_area` (nullable: `primary_locale`, `cities[]`, `postal_codes[]`, `radius_km`, `regions_stated[]`, `countries[]` as ISO 3166-1 alpha-2 codes for where an online business ships or serves)
+- `contact`: `phone` (E.164), `email` (nullable; only a business address published on the business's own pages), `website`, `escalation_contact` (nullable). The contact form URL lives in `external_links.contact_form`
+- `operations`: `timezone`, `hours` (nullable display strings), `hours_structured` (nullable), `price_tier` (nullable), `currency` (nullable, ISO 4217), `payment_methods` (nullable), `key_attributes[]`
+- `policies` (nullable): `returns`, `delivery_shipping`, `cancellation_refund`, `warranty_guarantee`, each `{ summary, url }` and each nullable. Provenance is tracked per path, for example `policies.returns.summary`
+- `capabilities_and_actions`: `supported_intents[]`, `external_links{}` (the only store for links the agent may share, for example `contact_form`, `offers`, `order`)
 - `agent_guardrails`: `allowed_offers[]` (objects: `text`, `terms_url`, `expires_at`), `prohibited_actions[]`, `fallback_message`
-- `system`: `data_source[]`, `verification_status`, `publication_status`, `last_verified_at`, `field_provenance{}`, `warnings[]`
+- `system`: `verification_status` (`unverified` | `verified`), `publication_status`, `access_status` (`open` | `technical_block` | `explicit_opt_out`; recorded by ingest, never edited by hand; `explicit_opt_out` leads to `suppressed`, `technical_block` does not), `last_verified_at`, `field_provenance{}` (per field path: `source_url`, `method`, `confidence`, `retrieved_at`), `warnings[]` (see 5.1)
 
 Every field except identity name and `business_id` MUST be nullable. Absence is normal and the pipeline must handle it.
 
+**Added post-v1** (new core version plus a migration, section 4.5): `capabilities_and_actions.agent_status` (`disabled` | `draft` | `published`), `agent_guardrails.custom_instructions` (owner-written; never overrides the guardrails or principles), `system.verification_details` (`ownership_method` as `phone` | `email` | `domain_txt` | `other`, `identity_checked`, `verified_at`), the `claimed` value of `verification_status` (a claim alone is not verification), and the `catalog` block with its `catalog_items` table. In v1 the chat agent is available whenever `publication_status = published`.
+
+
 - **Null means unknown, not "no".** Booleans are tri-state: `true`, `false`, or `null`. The extractor emits `false` only when a source states it (for example "we do not offer weekend service"), never because the data is silent. Search, chat, and match state (section 7.4) all treat `null` as unknown.
-- **Provenance.** Each `field_provenance` entry carries `source_url`, `method`, `confidence`, `retrieved_at`, `ladder_step` (section 5.1), and `origin` (`business`, `third_party`, or `llm_inferred`).
-- **Freshness.** Time-sensitive fields (`operations.hours*`, `agent_guardrails.allowed_offers`, prices, `price_tier`) are judged by their `retrieved_at`, not just the record's `last_verified_at` (section 6.4).
+- **Provenance.** Each `field_provenance` entry carries `source_url`, `method`, `confidence`, `retrieved_at`, and also `ladder_step` (section 5.1) and `origin` (`business`, `third_party`, or `llm_inferred`).
+- **Hours.** `hours_structured` is the source of truth. `hours` (display strings) is generated from it; it holds source text only when the hours could not be parsed, and is then flagged in `warnings[]`.
+- **Derived, not stored.** The data sources behind a record (for the "built from public listings" notice) and the ladder steps used are computed from `field_provenance` at read time. Parking, access, and similar details live in `knowledge.facts` (for example key `parking_and_access`).
+- **Freshness.** Time-sensitive fields (`operations.hours*`, `agent_guardrails.allowed_offers`, `policies.*`, prices, `price_tier`) are judged by their `retrieved_at`, not just the record's `last_verified_at` (section 6.4).
 
 ### 4.2 Layer 2: Profile (vertical-specific, pluggable)
 
@@ -109,7 +115,7 @@ Each profile is a JSON Schema file in `/schemas/profiles/` plus a small manifest
 
 Adding a vertical = adding these files. No pipeline, search, or chat code changes.
 
-Initial profiles: `generic@1.0` (fallback, empty data), `restaurant@1.0` (`signature_items`, `dietary_options`, `cuisine`, `reservation_policy`), `home_services@1.0` (`services[]`, `licenses[]`, `emergency_service`, `residential_commercial`, `guarantees[]`). Summaries in Appendix A.
+Initial profiles: `generic@1.0` (fallback, empty data), `restaurant@1.0` (`signature_items`, `dietary_options`, `cuisine`, `reservation_policy`), `home_services@1.0` (`services[]`, `licenses[]`, `emergency_service`, `residential_commercial`). Guarantees live in core `policies.warranty_guarantee`. Summaries in Appendix A.
 
 ### 4.3 Layer 3: Knowledge (generic long tail)
 
@@ -173,9 +179,10 @@ Rules:
 - **Technical blocks are not opt-outs.** A block sends ingest down the ladder. Steps 3 and 4 use only the provider's licensed API output and never contact the blocked site. The pipeline never evades a block on the site itself: no user-agent spoofing, proxy rotation, CAPTCHA solving, or cached and archived copies.
 - **Exa request shape.** Both modes request `contents: { "highlights": true }` and MUST be served from Exa's cache only (`contents.maxAgeHours: -1`, or `type: "lite"`), so the provider never live-crawls the target. Never set `maxAgeHours` to `0` or a positive value, `livecrawl`, or `livecrawlTimeout` on ladder calls. Site mode sets `includeDomains` to the target host; broad mode sets no domain filter.
 - **Tavily (alternative).** Tavily uses its own request shape (for example `include_domains` for site mode). A provider is eligible for step 3 only if it can be configured to return results without live-fetching the target. Verify this for Tavily before enabling it, and until verified use Tavily for step 4 only. The same evidence, trust, and audit rules apply to every provider.
-- **Search evidence is lower trust.** It records `ladder_step`, the source URL, and `method`; it is marked `origin: third_party` when it is not the business's own words; and it ranks below steps 1 and 2 in merge. The merger MUST reject search-derived values for `allowed_offers`, guarantees, and prices.
+- **Search evidence is lower trust.** It records `ladder_step`, the source URL, and `method`; it is marked `origin: third_party` when it is not the business's own words; and it ranks below steps 1 and 2 in merge. The merger MUST reject search-derived values for `allowed_offers`, guarantees (`policies.warranty_guarantee`), and prices.
 - **Honor provider terms** on storing and reusing results. Store only what the terms allow; keep an audit entry (provider, query, timestamp) per call.
 - Snippets are untrusted content: apply the prompt-injection hygiene in section 6.3.
+- Record the outcome on the document: `system.access_status` (`open`, `technical_block`, or `explicit_opt_out`) and a `system.warnings[]` entry for each block, skipped step, or low-confidence fill. Which steps filled which fields is in `field_provenance.ladder_step`; there is no separate list.
 - Log, per job, which step filled each field. These counts feed the fallback-ladder evals (section 12).
 
 ## 6. Ingestion pipeline
@@ -191,7 +198,7 @@ Rules:
 
 - Check `llms.txt` and the sitemap first (ladder step 1), then same-host links, prioritized by path keywords (services, menu, products, about, contact, hours, location, faq, policies, offers, pricing, booking, reserve, catering). Cap at `max_pages`.
 - MUST respect robots.txt, crawl-delay, and meta robots / `X-Robots-Tag`. Identify with a clear User-Agent and contact URL.
-- **noindex / nofollow handling**: the page MAY be fetched once to evaluate, but the resulting record's `publication_status` is set to `suppressed` with reason `opt_out` (section 11), and the extractor does not follow nofollow links.
+- **noindex / nofollow handling**: the page MAY be fetched once to evaluate, but the resulting record's `publication_status` is set to `suppressed` (section 11; the reason is `opt_out`, kept in `suppression_list` and `system.access_status`), and the extractor does not follow nofollow links.
 - Try plain HTTP first; fall back to Playwright for JS-heavy pages. Extract JSON-LD, OpenGraph, `tel:` / `mailto:` links, and PDFs linked as menus/brochures.
 - Store raw HTML and cleaned text per page with `retrieved_at` timestamps.
 
@@ -214,7 +221,7 @@ Rules:
 - Phone to E.164. Geocode addresses when present. For service-area businesses, normalize `service_area` to cities and postal codes where the site or source states them; do not guess ZIP lists.
 - Hours to `hours_structured` in the business's timezone when hours exist.
 - **Freshness policy**: each time-sensitive field has a max age (defaults: hours 30 days, offers 14 days, prices 14 days; configurable). Past the max age the field is *stale*: the agent hedges it ("as of {date}, please confirm by phone"), ranking penalizes it, and the refresh scheduler prioritizes it.
-- Categories mapped to a controlled taxonomy with aliases (`/schemas/taxonomy/categories.json`).
+- Categories mapped to a controlled taxonomy with aliases (`/schemas/taxonomy/categories.json`) and stored as taxonomy IDs; the first is the primary category. Original labels stay in `source_evidence`.
 
 ### 6.5 Durable execution (Temporal)
 
@@ -402,7 +409,7 @@ With an active set, the panel offers one tab per agent plus an "Ask all" tab. An
 
 ## 9. Data store (Postgres)
 
-- `businesses(business_id PK, host, phone_norm, doc JSONB, core_version, profile_ref, verification_status, publication_status, suppression_reason, geo, created_at, updated_at, last_verified_at)`
+- `businesses(business_id PK, host, phone_norm, doc JSONB, core_version, profile_ref, verification_status, publication_status, geo, created_at, updated_at, last_verified_at)`
 - `business_embeddings(business_id, view, embedding vector, doc_version)`
 - `service_areas(business_id, kind, value)` for city/ZIP matching
 - `source_evidence(id, business_id, field_path, value, source, method, confidence, retrieved_at, ladder_step, origin)`
@@ -423,7 +430,7 @@ Indexes: GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, B-tree on
 Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and no listing is claimed. Design intent for later:
 
 - Owner starts a claim for a listing and verifies control (email at the site's domain, phone call/SMS to the listed number, or a DNS/meta tag).
-- On success: `verification_status = "verified"`, owner can edit JSON, set `escalation_contact`, set `publication_status`, review held leads, and opt an excluded site back in.
+- On success: `verification_status = "verified"`, owner can edit JSON, set `escalation_contact`, set `publication_status`, review held leads, and opt an excluded site back in. This is also when `verification_details`, `agent_status`, and `custom_instructions` arrive (section 4.1).
 - Owner edits are stored as owner evidence and win during merge.
 
 ## 11. Publication and compliance
@@ -530,30 +537,32 @@ README.md
   "schema_version": "core-1.0",
   "business_id": "biz_ecoguard_pest_management_sunnyvale",
   "parent_brand": { "name": "EcoGuard Pest Management", "website": null, "nationwide_claims": ["26,000+ families nationwide"] },
-  "identity": { "dba_name": "EcoGuard Pest Management", "tagline": null, "categories": ["Pest Control Service"], "brand_voice": "Reassuring, professional" },
+  "identity": { "dba_name": "EcoGuard Pest Management", "tagline": null, "description": null, "categories": ["pest_control"], "brand_voice": "Reassuring, professional", "media": null },
   "location": {
-    "is_service_area_business": true,
+    "presence": "service_area",
+    "label": null,
     "address": null,
     "geo": null,
-    "service_area": { "primary_locale": "Sunnyvale, CA", "cities": ["Sunnyvale"], "postal_codes": null, "radius_km": null, "regions_stated": ["CA","OR","WA","TX","TN","NV"] }
+    "service_area": { "primary_locale": "Sunnyvale, CA", "cities": ["Sunnyvale"], "postal_codes": null, "radius_km": null, "regions_stated": ["CA","OR","WA","TX","TN","NV"], "countries": ["US"] }
   },
-  "contact": { "phone": "+14086382951", "website": "https://sunnyvale-ca.ecoguard-pestcontrol.com/", "contact_form": ".../contact-us/", "escalation_contact": null },
-  "operations": { "timezone": "America/Los_Angeles", "hours": null, "hours_structured": null, "price_tier": null, "payment_methods": null, "key_attributes": ["Free estimates", "Licensed & insured"] },
-  "profile": { "type": "home_services", "schema_ref": "profiles/home_services@1.0", "data": { "services": ["Ant Control", "Termite Services"], "emergency_service": true, "residential_commercial": ["residential", "commercial"], "guarantees": ["Free re-treatment between scheduled visits"], "licenses": null } },
+  "contact": { "phone": "+14086382951", "email": null, "website": "https://sunnyvale-ca.ecoguard-pestcontrol.com/", "escalation_contact": null },
+  "operations": { "timezone": "America/Los_Angeles", "hours": null, "hours_structured": null, "price_tier": null, "currency": null, "payment_methods": null, "key_attributes": ["Free estimates", "Licensed & insured"] },
+  "policies": { "returns": null, "delivery_shipping": null, "cancellation_refund": null, "warranty_guarantee": { "summary": "Free re-treatment between scheduled visits", "url": null } },
+  "profile": { "type": "home_services", "schema_ref": "profiles/home_services@1.0", "data": { "services": ["Ant Control", "Termite Services"], "emergency_service": true, "residential_commercial": ["residential", "commercial"], "licenses": null } },
   "knowledge": { "facts": [], "faqs": [], "documents": [], "social_proof": [] },
-  "capabilities_and_actions": { "supported_intents": ["answer_faq", "answer_catalog_questions", "check_service_coverage", "share_current_offers", "capture_lead", "share_link"], "external_links": { "free_estimate_form": ".../contact-us/", "offers": ".../offers/" } },
+  "capabilities_and_actions": { "supported_intents": ["answer_faq", "answer_catalog_questions", "check_service_coverage", "share_current_offers", "capture_lead", "share_link"], "external_links": { "contact_form": ".../contact-us/", "offers": ".../offers/" } },
   "agent_guardrails": {
     "allowed_offers": [{ "text": "50% off initial service", "terms_url": ".../offers/", "expires_at": null }],
     "prohibited_actions": ["Do not quote prices; direct to free estimate", "Do not guarantee elimination of a pest or timeline", "Do not give medical advice"],
     "fallback_message": "I don't have that detail, but our team can help. Share your name and best phone number, or call 408-638-2951."
   },
-  "system": { "data_source": ["web_crawl"], "verification_status": "unverified", "publication_status": "suppressed", "last_verified_at": "2026-11-20T02:11:00Z", "field_provenance": { "contact.phone": { "source_url": ".../contact-us/", "method": "html_tel_link", "confidence": 0.98, "retrieved_at": "2026-11-20T02:11:00Z", "ladder_step": 1, "origin": "business" } }, "warnings": ["Page declares noindex,nofollow; suppressed (opt_out)"] }
+  "system": { "verification_status": "unverified", "publication_status": "suppressed", "access_status": "explicit_opt_out", "last_verified_at": "2026-11-20T02:11:00Z", "field_provenance": { "contact.phone": { "source_url": ".../contact-us/", "method": "html_tel_link", "confidence": 0.98, "retrieved_at": "2026-11-20T02:11:00Z", "ladder_step": 1, "origin": "business" } }, "warnings": ["Page declares noindex,nofollow; suppressed (opt_out)"] }
 }
 ```
 
 ### Profile summaries
 
 - **`restaurant@1.0`** data: `cuisine[]`, `signature_items[{name, price, dietary[]}]`, `menu_url`, `dietary_options[]`, `reservation_policy`, `catering{available, lead_time}`. Facets: `cuisine`, `dietary_options`. Catalog path: `signature_items`.
-- **`home_services@1.0`** data: `services[]`, `licenses[{type, number, state}]`, `emergency_service`, `residential_commercial[]`, `guarantees[]`, `estimate_policy`. Facets: `services`, `residential_commercial`. Catalog path: `services`.
+- **`home_services@1.0`** data: `services[]`, `licenses[{type, number, state}]`, `emergency_service`, `residential_commercial[]`, `estimate_policy`. Facets: `services`, `residential_commercial`. Catalog path: `services`.
 - **`generic@1.0`** data: `{}`. All details go to `knowledge`.
 - Boolean profile fields (for example `emergency_service`) are nullable. `null` means unknown.
