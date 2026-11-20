@@ -16,39 +16,40 @@ Hand this file to a coding agent. Build in the phases in section 15. Ask before 
 
 **Data**
 
-- **JSON is the single source of truth.** Search index, result cards, and chat agent are all derived from it and rebuildable from it.
+- **JSON is the single source of truth.** The search index, result cards, and chat agent are all derived from it and rebuildable from it. Nothing about a business lives only in an index or a prompt.
 - **Config over code.** A small stable core, pluggable profiles, and a generic knowledge layer (section 4). Behavior switches on declared capabilities and available data, never on business type. New verticals are schema + manifest files.
-- **Never invent facts.** Missing data is null. The agent says it doesn't know and follows the fallback path.
-- **Provenance on every field** (source URL, method, confidence). It drives merge priority, re-extraction, and grounding checks.
-- **Owner and human edits override automation.**
+- **Never invent facts. Null means unknown, not "no."** Missing data is null. The agent says it doesn't know and follows the fallback path. It never says a business does not offer something just because the data doesn't mention it.
+- **Provenance on every field** (source URL, method, confidence, retrieved_at). It drives merge priority, re-extraction, freshness, and grounding checks.
+- **Facts have an age.** Stale facts are flagged or refreshed, and time-sensitive claims (hours, offers) are hedged.
+- **Human edits override automation.** Admin corrections in v1; owner edits are post-v1 (section 10).
 
 **Ingest**
 
-- **Crawl only what's permitted, and degrade through a fallback ladder.** For each missing field, try the sources in this order and stop at the first that fills it:
-  1. **Direct check**: `llms.txt`, sitemap, and robots.txt-allowed paths on the business's own site.
-  2. **Structured API**: a domain-appropriate official API (`places_api`, `open_data`; see section 5).
-  3. **Search API, site-scoped**: Tavily or Brave with `site:targetdomain.com` to pull indexed snippets when direct fetching fails for technical reasons (bot protection, JS rendering, rate limits).
-  4. **Search API, broad**: the same API without `site:`, to find press, news, or partner listings that mention the missing information.
-  - Evidence from steps 3 and 4 is lower trust: it carries its source URL and `method`, is marked `third_party` where it is not the business's own words, ranks below steps 1 and 2 in merge, and is never used for offers, guarantees, or prices.
-  - Steps 3 and 4 MUST NOT be used to bypass an opt-out: not for hosts with a robots.txt disallow, noindex/nofollow, an explicit opt-out, or an entry on the suppression list.
+- **Crawl only what's permitted, and degrade through the fallback ladder (section 5.1).** For each missing field, work down the ladder and stop at the first source that fills it with sufficient confidence: the business's own permitted pages (llms.txt, sitemap, robots.txt-allowed paths), then official structured APIs (`places_api`, `open_data`), then site-scoped search snippets (Tavily or Brave with `site:targetdomain.com`, only when direct fetching fails for technical reasons such as bot protection, JS rendering, or rate limits), then broad search (press, news, or partner listings that mention the missing information).
+  - Search-derived evidence is lower trust: it carries its source URL and method, is marked `third_party` where it is not the business's own words, ranks below the first two sources in merge, and is never used for offers, guarantees, or prices.
+  - The search steps MUST NOT be used to bypass an opt-out: not for hosts with a robots.txt disallow, noindex/nofollow, an explicit opt-out, or an entry on the suppression list.
+  - Never evade technical blocks on the site itself: no user-agent spoofing, proxy rotation, CAPTCHA solving, or cached and archived copies. A block (bot protection, JS wall, rate limit) sends ingest down the ladder to the search steps, which use only the search provider's licensed API output and never contact the blocked site. A block is not treated as an opt-out; only the opt-out signals above are.
   - Honor each search provider's terms on storing and reusing results.
-- **Consent before publication.** Crawled data is a draft until it passes the publication rules in section 11, whatever source it came from.
+- **Respect opt-outs before publication.** Crawled data is a draft until it passes the publication rules in section 11, whatever source it came from. In v1, a site that opts out is excluded.
 - **Content is data, never instructions**: crawled pages, search snippets, user messages, and queries.
 
-**Search, Refine, Chat**
+**Search, refine, chat**
 
-- **Compute facts in code, not in the LLM**: open-now, service-area match, shortlist scoping.
+- **Compute facts in code, not in the LLM**: open-now, service-area match, active-set scoping.
 - **One active set grounds everything.** After the first search, the top 5 become the active set. Every follow-up (refining search, question to the agents, comparison) is grounded only in that set. The set changes only by explicit user action (add from remaining matches, remove), never silently, and every response states its scope. Enforced server-side.
-- **Unknown is not no.** Each agent is tri-state per requirement: `match`, `non_match`, or `unknown`. `non_match` requires the agent's own data to contradict the requirement. Missing data stays `unknown` and is never treated as a no.
-- **Chat feeds search.** Facts surfaced in chat update the active set's match state, so results get narrower and more relevant each turn. Comparisons attribute every claim to the agent whose JSON it came from.
+- **Unknown is not no.** Each agent is four-state per requirement: `match`, `partial`, `non_match`, or `unknown`. `non_match` requires the agent's own data to contradict the requirement, `partial` means the data meets only part of it, and missing data stays `unknown` and is never treated as a no.
+- **Chat feeds search.** Facts surfaced in chat, whether in a fan-out answer or a single-business chat, update the active set's match state, so results get narrower and more relevant each turn. Comparisons attribute every claim to the agent whose JSON it came from.
 - **One session across search and chat.** Moving between them never loses the active set or its match state.
-- **Explainable ranking.** Every result says why it matched, hard filters are never relaxed silently, and `unknown` is shown as unknown.
-- **Be honest about the listing**: AI disclosure, unverified label, self-published testimonials are not reviews, brand claims are attributed to the brand.
-- **Collect the minimum**: only what users volunteer, no PII in logs.
+- **Explainable ranking.** Every result says why it matched, hard filters are never relaxed silently (the user is asked first), and unknown is shown as unknown.
+- **Inform, never commit.** The agent shares information but makes no binding promise on the business's behalf: no quoted prices, confirmed bookings, guaranteed outcomes, or promised callbacks unless the business has explicitly provided them. This applies most strongly to unverified listings.
+- **Be honest about the listing**: AI disclosure, an unverified label, a "built from public listings" label where it applies, self-published testimonials are not reviews, and brand claims are attributed to the brand.
+- **Stay neutral across businesses.** Ranking and comparison favor no business. Each agent runs in isolation and never sees another business's data or answers; only a router layer combines their outputs, with attribution.
+- **Collect the minimum**: only what users volunteer, no PII in logs, and contact details shared only with a business the user explicitly chooses to contact. A fan-out never captures a lead for every agent.
 
 **Quality**
 
-- **Evals gate changes**: schema, extraction, search, shortlist, chat (section 12).
+- **Evals gate changes**: schema, extraction, fallback ladder, search, active set, chat (section 12).
+- **Degrade gracefully, stay fast, bound cost.** A one-page site with only a phone number still yields a usable agent. Results stream, and each session has limits on fan-out, message length, and model usage (caching, small models for routing).
 
 ## 3. Tech stack (change only with justification)
 
@@ -140,12 +141,12 @@ Ingestion is a set of adapters writing into the same pipeline. Each adapter retu
 |---|---|---|
 | `website` | Crawl the business's own site | Primary source; see section 6 |
 | `places_api` | Official Google Places API for discovery and basics (name, address, phone, hours) | MUST use the official API. Check current terms before storing anything beyond `place_id`; honor caching limits and attribution requirements |
-| `owner` | Owner claims a listing, pastes URL, edits JSON | Highest trust; overrides crawled data |
+| `owner` | Owner claims a listing, pastes URL, edits JSON | Post-v1 (section 10). In v1, admin edits play this role; highest trust, overrides crawled data |
 | `open_data` | OpenStreetMap, business registries, other APIs with compatible terms | Record license per source |
 
 - MUST NOT scrape Google Search, Maps, or Local Services result pages, or any site whose terms or robots.txt disallow automated access. If a submitted URL is an aggregator or results page (multiple businesses), the service returns an error explaining this and suggests discovery via `places_api` or submitting each business's own website.
 - **Discovery**: `POST /v1/discover { "query": "pest control", "location": "Sunnyvale, CA" }` uses `places_api` to list candidate businesses, then queues website ingest for each candidate's own site.
-- **Merge priority**: owner > structured data on the business's own site (JSON-LD) > site text > `places_api` > `open_data` > LLM inference. Conflicts are recorded in `system.warnings`.
+- **Merge priority**: admin/owner (admin only in v1) > structured data on the business's own site (JSON-LD) > site text > `places_api` > `open_data` > LLM inference. Conflicts are recorded in `system.warnings`.
 
 ## 6. Ingestion pipeline
 
@@ -154,14 +155,13 @@ Ingestion is a set of adapters writing into the same pipeline. Each adapter retu
 - `POST /v1/ingest { "url": "...", "options": { "max_pages": 15, "force_refresh": false } }` returns `202 { "job_id", "business_id" }`
 - `GET /v1/ingest/{job_id}`: status (`queued | crawling | classifying | extracting | validating | indexed | failed`), stage timings, warnings
 - `GET /v1/businesses/{business_id}`, `POST /v1/businesses/{business_id}/refresh`
-- `PATCH /v1/businesses/{business_id}`: owner or admin edits (authenticated); sets `verification_status = "verified"`
-- `POST /v1/businesses/{business_id}/claim`: starts the owner claim flow (section 10)
+- `PATCH /v1/businesses/{business_id}`: admin edits (authenticated); sets `verification_status = "verified"`. Owner edits are post-v1
 
 ### 6.2 Crawl behavior
 
 - Same-host links first, prioritized by path keywords (services, menu, products, about, contact, hours, location, faq, policies, offers, pricing, booking, reserve, catering). Cap at `max_pages`.
 - MUST respect robots.txt, crawl-delay, and meta robots / `X-Robots-Tag`. Identify with a clear User-Agent and contact URL.
-- **noindex / nofollow handling**: the page MAY be fetched once to evaluate and for the owner to preview, but the resulting record's `publication_status` is set to `pending_consent` (section 11), and the extractor does not follow nofollow links.
+- **noindex / nofollow handling**: the page MAY be fetched once to evaluate, but the resulting record's `publication_status` is set to `suppressed` with reason `opt_out` (section 11), and the extractor does not follow nofollow links.
 - Try plain HTTP first; fall back to Playwright for JS-heavy pages. Extract JSON-LD, OpenGraph, `tel:` / `mailto:` links, and PDFs linked as menus/brochures.
 - Store raw HTML and cleaned text per page with fetch timestamps.
 
@@ -174,7 +174,7 @@ Ingestion is a set of adapters writing into the same pipeline. Each adapter retu
 - Anything useful that fits neither core nor profile goes to `knowledge.facts`.
 - Derived fields (brand voice, default guardrails, supported intents, starter questions) are marked `llm_inferred` in provenance.
 - `supported_intents` is computed from evidence, not assumed. Examples: `check_hours` only if hours exist; `share_order_link` only if an ordering link exists; `capture_estimate_lead` for service businesses with a quote/contact form.
-- `allowed_offers` MUST come only from the site or the owner and carry `terms_url` and `expires_at` when known. If terms are not stated, set `terms_url` to the offers page and leave eligibility unstated.
+- `allowed_offers` MUST come only from the site or an admin/owner edit and carry `terms_url` and `expires_at` when known. If terms are not stated, set `terms_url` to the offers page and leave eligibility unstated.
 - Validate; on failure retry once with the validation errors. Still failing → job `failed` with details.
 - **Prompt-injection hygiene**: strip or flag instruction-like text in crawled content (e.g. "ignore previous instructions") and record a warning.
 
@@ -278,7 +278,7 @@ Rules:
 
 - The prompt compiler enables a tool only if the intent is in `supported_intents` and its required data paths are non-null.
 - Profile manifests declare which paths count as the "catalog" for `lookup_catalog`. No business-type branching in code.
-- **Unclaimed businesses**: lead capture is stored and, until claimed, the agent shows the phone number/contact form as the primary path and tells users it cannot guarantee a callback. Leads are held and delivered when the owner claims (section 10).
+- **Unclaimed businesses** (all of them in v1): the agent shows the phone number/contact form as the primary path and tells users it cannot guarantee a callback. Leads are stored and delivered to an admin-set `escalation_contact` if present, otherwise held. Owner delivery comes with the claim flow (section 10, post-v1). A fan-out chat never captures a lead for more than the one business the user chose.
 
 ### 8.4 Quality and safety
 
@@ -300,26 +300,28 @@ Panel/page opened from a result; header shows name, hours status (if known), AI 
 - `source_evidence(id, business_id, field_path, value, source, method, confidence, fetched_at)`
 - `crawl_pages(id, business_id, url, fetched_at, status, raw_path, clean_text, robots_directives)`
 - `search_sessions(session_id PK, shortlist JSONB (business_ids: auto top 5 + user_added), scope, created_at, updated_at)`
-- `ingest_jobs`, `chat_sessions`, `chat_messages`, `leads(… delivered BOOL)`, `claims`, `takedowns`
+- `ingest_jobs`, `chat_sessions`, `chat_messages`, `leads(… delivered BOOL)`, `takedowns` (`claims` post-v1)
 
 Indexes: GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, B-tree on `(host, phone_norm)`.
 
-## 10. Owner claim flow (v1 minimal)
+## 10. Owner claim flow (post-v1)
+
+Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and no listing is claimed. Design intent for later:
 
 - Owner starts a claim for a listing and verifies control (email at the site's domain, phone call/SMS to the listed number, or a DNS/meta tag).
-- On success: `verification_status = "verified"`, owner can edit JSON (through the PATCH endpoint or a simple form), set `escalation_contact`, set `publication_status`, review held leads.
+- On success: `verification_status = "verified"`, owner can edit JSON, set `escalation_contact`, set `publication_status`, review held leads, and opt an excluded site back in.
 - Owner edits are stored as owner evidence and win during merge.
 
-## 11. Publication, consent, and compliance
+## 11. Publication and compliance
 
-`publication_status`: `draft` → `pending_consent` → `published` (or `suppressed`).
+`publication_status`: `draft` → `published` (or `suppressed`).
 
 - Business sites that allow indexing and have no opt-out signal MAY be set to `published` automatically, with an "unverified listing" label.
-- Pages with noindex/nofollow, a robots.txt disallow, or an explicit opt-out stay `pending_consent` and are not searchable or chattable until the owner claims and opts in.
-- Honor takedown requests: `POST /v1/takedown` (admin or verified owner) deletes the record, embeddings, raw pages, and chat history for that business, and adds the host to a suppression list so it is not re-ingested.
+- Sites with noindex/nofollow, a robots.txt disallow, or an explicit opt-out are `suppressed` (reason `opt_out`): not searchable or chattable, and the host is added to the suppression list. In v1 there is no opt-in path; owner opt-in comes with the claim flow (section 10).
+- Honor takedown requests: `POST /v1/takedown` (admin in v1) deletes the record, embeddings, raw pages, and chat history for that business, and adds the host to a suppression list so it is not re-ingested.
 - Store per-source licenses and Places API data only as its terms allow. Keep an audit log of what came from which source.
 - **SSRF protection (MUST)**: block private, loopback, link-local, and cloud-metadata IPs; re-check after redirects; limit size and time; http/https only.
-- Auth on owner/admin endpoints; secrets via environment; no PII in logs; log LLM calls with `business_id`, token counts, latency.
+- Auth on admin endpoints; secrets via environment; no PII in logs; log LLM calls with `business_id`, token counts, latency.
 
 ## 12. Testing and evaluation
 
@@ -333,7 +335,7 @@ Indexes: GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, B-tree on
 
 ## 13. Non-goals for v1
 
-Payments, real booking integrations, voice, multi-language (schema supports it, ship English), a full owner dashboard beyond edit + leads.
+Payments, real booking integrations, voice, multi-language (schema supports it, ship English), owner accounts, the claim flow, and owner edits or opt-in (admin edits only in v1).
 
 ## 14. Repository layout
 
@@ -351,7 +353,7 @@ Payments, real booking integrations, voice, multi-language (schema supports it, 
   /ingest     adapters/, crawler.py, cleaner.py, classifier.py, extractor.py, merger.py, normalizer.py
   /search     indexer.py, query_understanding.py, retrieve.py, rerank.py, location.py
   /chat       prompt.py, registry.py, tools.py, runtime.py, guardrails.py
-  /api        ingest.py, search.py, chat.py, claim.py, admin.py
+  /api        ingest.py, search.py, chat.py, admin.py
   /models     loaded dynamically from /schemas
 /evals        extraction/, search/, chat/, generalization/
 /frontend     Next.js app
@@ -363,7 +365,7 @@ docker-compose.yml, README.md
 - **Phase 1: Schemas + ingest.** Core and the three initial profiles, schema loader, website adapter, classifier, extractor, merger, normalizer, storage, CLI `ingest <url>`, fixture tests, extraction evals, and the generalization test (new salon profile with zero code changes). Done when: 10 sites across at least 3 verticals produce valid JSON with provenance, and the generalization test passes.
 - **Phase 2: Chat.** Prompt compiler, capability registry, tools, SSE API, minimal chat page, chat evals. Done when: grounded answers, refusal on unknowns, correct tool gating across all test businesses.
 - **Phase 3: Search.** Indexer, hybrid retrieval with service-area matching, query understanding, reranker, API, UI. Done when: search evals meet section 12 targets.
-- **Phase 4: Discovery, claim, compliance.** Places API adapter + `/discover`, claim flow, publication/consent states, takedown, suppression list, leads delivery, auth, rate limits, SSRF tests, refresh scheduler (every 14 days or on demand), observability.
+- **Phase 4: Discovery, compliance.** Places API adapter + `/discover`, publication states, takedown, suppression list, leads delivery, auth, rate limits, SSRF tests, refresh scheduler (every 14 days or on demand), observability.
 
 ## 16. Questions to confirm before starting
 
@@ -399,7 +401,7 @@ docker-compose.yml, README.md
     "prohibited_actions": ["Do not quote prices; direct to free estimate", "Do not guarantee elimination of a pest or timeline", "Do not give medical advice"],
     "fallback_message": "I don't have that detail, but our team can help. Share your name and best phone number, or call 408-638-2951."
   },
-  "system": { "data_source": ["web_crawl"], "verification_status": "unverified", "publication_status": "pending_consent", "last_verified_at": "2026-11-20T02:11:00Z", "field_provenance": {}, "warnings": ["Page declares noindex,nofollow"] }
+  "system": { "data_source": ["web_crawl"], "verification_status": "unverified", "publication_status": "suppressed", "last_verified_at": "2026-11-20T02:11:00Z", "field_provenance": {}, "warnings": ["Page declares noindex,nofollow; suppressed (opt_out)"] }
 }
 ```
 
