@@ -7,6 +7,7 @@ Hand this file to a coding agent. Build in the phases in section 15. Ask before 
 - **Ingest**: a backend service takes a business URL (or a discovered listing), gathers data from permitted sources, and produces a structured Business JSON document.
 - **Search**: a public webpage where people type natural-language queries (Exa.ai-style: "eco-friendly pest control in Sunnyvale, same-day", "vegan South Indian brunch open Sunday") and get ranked, relevant businesses.
 - **Chat**: from any result, the user can chat with that business. The agent is assembled on the fly from that business's JSON. No per-business code, training, or deployment.
+- **Refine**: after the first search, the user can either chat with an agent or keep searching to narrow down the results. The top 5 results become the user's shortlist. Follow-up searches only cover the shortlist, not the full index. The user can add more agents from the wider results by selecting them. From then on, search covers the top 5 plus whatever the user selected.
 
 ## 2. Principles
 
@@ -175,9 +176,21 @@ Emulate: natural-language, meaning-based queries; ranked results with content-ri
 
 `GET /v1/businesses/{id}/similar` for find-similar.
 
+### 7.2.1 Shortlist-grounded refinement
+
+- The first search in a session returns ranked results. The top 5 become the session's **shortlist** (`search_sessions.shortlist`).
+- Follow-up searches in the same session (`POST /v1/search` with `session_id`) are **grounded on the shortlist**: retrieval is restricted to `business_id IN shortlist`, then reranked. The query understanding step treats follow-ups as refinements ("which of these is open Sunday?"), not new searches.
+- The user can add agents from the wider result set: `POST /v1/search/sessions/{session_id}/shortlist { "add": [business_id], "remove": [business_id] }`. Added agents are pinned and count in addition to the top 5. Search is then grounded on the top 5 plus the user's selections.
+- `POST /v1/search { "session_id": "...", "scope": "all" }` (or a "start over" action) clears the shortlist and runs a full-index search.
+- Chat and refinement work together: the user can open a chat with any shortlisted agent and return to searching without losing the shortlist.
+- Only `publication_status = "published"` records can be shortlisted. If a shortlisted business is later suppressed, it is dropped from the shortlist.
+- The response includes `scope` (`"all"` or `"shortlist"`) and the current shortlist, so the UI can show what the search was grounded on.
+
 ### 7.3 Search UI
 
 Minimal Exa-style landing page, example chips, location control, result cards with a "Chat with this business" button and call/website links, facet sidebar built from manifests, streaming/skeleton loading, responsive, accessible.
+
+Shortlist UI: the top 5 results are visibly marked as the shortlist. Other results have an "Add to shortlist" control. A shortlist bar shows the current agents with remove buttons, a scope indicator ("Searching within 5 of your shortlist"), and a "Search all" action that resets scope. The search box and chat panel are both available while a shortlist is active.
 
 ## 8. Chat agent (assembled from JSON)
 
@@ -254,6 +267,7 @@ Panel/page opened from a result; header shows name, hours status (if known), AI 
 - `service_areas(business_id, kind, value)` for city/ZIP matching
 - `source_evidence(id, business_id, field_path, value, source, method, confidence, fetched_at)`
 - `crawl_pages(id, business_id, url, fetched_at, status, raw_path, clean_text, robots_directives)`
+- `search_sessions(session_id PK, shortlist JSONB (business_ids: auto top 5 + user_added), scope, created_at, updated_at)`
 - `ingest_jobs`, `chat_sessions`, `chat_messages`, `leads(… delivered BOOL)`, `claims`, `takedowns`
 
 Indexes: GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, B-tree on `(host, phone_norm)`.
@@ -281,6 +295,7 @@ Indexes: GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, B-tree on
 - **Extraction evals**: a golden set of 30+ real sites across at least 4 verticals (include a restaurant, a service-area business, a franchise subdomain, and a thin one-page site), with hand-labeled JSON. Report per-field precision/recall and profile-classification accuracy. Gate merges on no regression.
 - **Generalization test**: add a brand-new profile (e.g. salon) using only schema + manifest files, then verify ingest, search, and chat work with zero code changes. This test MUST pass before Phase 1 is considered done.
 - **Search evals**: 50+ labeled queries including service-area ("near me" for a business with no address). Report nDCG@10 and recall@30 for vector-only vs hybrid vs hybrid+rerank.
+- **Shortlist evals**: multi-turn sessions. Follow-up queries return only shortlisted agents (zero leakage from outside the shortlist); adding an agent includes it in later searches; removing one excludes it; "search all" resets scope; suppressed businesses are dropped from the shortlist.
 - **Chat evals**: grounded answers; refusal on unknown facts; guardrail adherence; injection resistance; correct tool gating (no hours tool when hours are null); lead capture on unclaimed businesses; correct handling of self-published testimonials and brand-level claims.
 - **Latency**: search p95 < 1.5 s; chat first token p95 < 2 s; typical ingest < 90 s.
 
