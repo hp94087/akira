@@ -605,22 +605,38 @@ With an active set, the panel offers one tab per agent plus an "Ask all" tab. An
 
 ## 9. Data store (Postgres)
 
-- `businesses(business_id PK, host (null for a listing-only business), website_norm, phone_norm, address_norm, name_norm, place_id (derived from `system.source_ids`), doc JSONB, core_version, profile_ref, verification_status, publication_status, geo, created_at, updated_at, last_verified_at)`
-- `business_embeddings(business_id, view, embedding vector, doc_version)`
-- `service_areas(business_id, kind, value)` for city/ZIP matching
-- `source_evidence(id, job_id, business_id (null until allocated), field_path, value, source, method, confidence, retrieved_at, ladder_step, origin)`
-- `crawl_pages(id, job_id, business_id (null until allocated), url, retrieved_at, status, raw_path, clean_text, robots_directives)`
-- `search_api_calls(id, job_id, business_id (null until allocated), provider, mode, query, results JSONB (url and outcome per result), retrieved_at)` audit log for the fallback ladder
-- `suppression_list(key_type, key_value, reason, created_at, PK(key_type, key_value))` with `key_type` as `host`, `place_id`, or `phone_norm`
-- `discovery_candidates(discovery_id, place_ref, name, status, job_id, business_id (null until allocated))`: a projection of the discovery workflow for `GET /v1/discover/{discovery_id}`
-- `search_sessions(session_id PK, active_set JSONB (business_ids: auto top 5 + user_added), requirements JSONB, match_state JSONB, scope, created_at, updated_at)`
-- `chat_sessions(session_id PK, search_session_id, created_at)`, `chat_messages(… target_business_id)`
-- `ingest_jobs(job_id = workflow_id, url, host, business_id (null until allocated), status, stage_timings, warnings, started_at, finished_at)`: a projection of workflow state for the status API
-- `leads(… delivered BOOL)`, `takedowns` (`claims` post-v1)
+The Business JSON in `businesses.doc` is the source of truth. Every other table is derived from it, is evidence or audit data about it, or is session data. Columns copied out of the JSON (the `_norm` keys, `geo`, the statuses) are rewritten in the same transaction as the document.
 
-Raw HTML and cleaned text live in object storage (`crawl_pages.raw_path` is an object key). Temporal keeps its own state in a separate Postgres database, never in the app database.
+**Business and index**
+- `businesses(business_id PK, host (null for a listing-only business), website_norm, phone_norm, address_norm, name_norm, place_id (derived from `system.source_ids`), doc JSONB, doc_version, indexed_doc_version, core_version, profile_ref, verification_status, publication_status, access_status, geo (nullable; the geocoder `license` may not allow storing it, section 5), search_tsv, next_refresh_at, created_at, updated_at, last_verified_at)`. `doc_version` increases on every write. `indexed_doc_version` is the version the index serves, so a record keeps its old index until the new one is built (section 4.5). `next_refresh_at` is the earliest `retrieved_at + max_age` over the record's time-sensitive fields (or `last_verified_at` + 14 days), and the refresh scan (section 6.5) reads it instead of scanning documents.
+- `business_embeddings(business_id, view, doc_version, embedding vector, PK(business_id, view, doc_version))`. Rows of an older `doc_version` are deleted after the swap.
+- `business_facets(business_id, doc_version, facet_name, value JSONB)`: one row per manifest facet (section 4.2), with a null `value` meaning unknown (section 7.1).
+- `service_areas(business_id, kind, value)` with `kind` as `city`, `postal_code`, or `country` (the last for `online` businesses). `radius_km` stays in the document.
 
-Indexes: B-tree on `website_norm`, GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, unique on `(host, phone_norm)` where `phone_norm` is not null, unique on `(host, address_norm)` where `phone_norm` is null and `address_norm` is not null (the dedupe keys of section 4.4), and unique on `place_id` where it is not null.
+**Ingest evidence and audit**
+- `source_evidence(id, job_id, business_id (null until allocated), field_path, value, source, source_url, method, confidence, retrieved_at, expires_at (from the adapter `license.cache_ttl`), ladder_step, origin)`. Only fields in the adapter's `storable_fields` are written (the write guard, section 5).
+- `crawl_pages(id, job_id, business_id (null until allocated), url, retrieved_at, status, raw_path, clean_text, robots_directives)`. `status` records the outcome, including a technical block (section 5.1).
+- `search_api_calls(id, job_id, business_id (null until allocated), provider, mode, request_form (`default_cache_only` or `lite`), query, results JSONB (url and outcome per result), retrieved_at, expires_at)`: the fallback-ladder audit log. Results are stored only as the provider's terms allow.
+- `ingest_jobs(job_id = workflow_id, url (null for a listing-only job), place_id (null unless listing-only), discovery_id (null unless started by discovery), host, business_id (null until allocated), status, stage_timings, warnings, error, started_at, finished_at)`: a projection of workflow state for the status API. `status` includes `suppressed` (section 6).
+- `discovery_candidates(discovery_id, place_ref, name (null unless the `places_api` license lists it as storable), status, job_id, business_id (null until allocated), PK(discovery_id, place_ref))`: a projection of the discovery workflow for `GET /v1/discover/{discovery_id}`.
+
+**Compliance**
+- `suppression_list(key_type, key_value, reason, created_at, PK(key_type, key_value))` with `key_type` as `host`, `place_id`, or `phone_norm`, and `reason` as `opt_out` or `takedown`. It holds only these keys, never business data.
+- `takedowns(takedown_id, key_type, key_value, requested_by, status, created_at, completed_at)`: the audit of a takedown workflow. It holds only keys, since the business data is deleted. (`claims` is post-v1.)
+
+**Search and chat sessions**
+- `search_sessions(session_id PK, active_set JSONB (business_ids: auto top 5 + user_added), remaining_candidates JSONB (the rest of the first search's ranked business_ids, which section 7.2.1 offers when a refinement leaves no match), requirements JSONB, match_state JSONB, scope, created_at, updated_at, expires_at)`.
+- `chat_sessions(session_id PK, search_session_id (null for a chat with no active set), created_at, expires_at)`.
+- `chat_messages(message_id PK, session_id, turn_id, target_business_id, role, content, tool_calls JSONB, created_at)`. A fan-out turn writes one row per agent under one `turn_id`. A takedown deletes the rows by `target_business_id` (section 11).
+- Sessions expire (default 24 hours, configurable) and are then deleted. Session text, queries, and locations are never written to logs (sections 7 and 11).
+- `leads(lead_id PK, business_id, session_id, contact_encrypted, name_encrypted, reason, details_encrypted, delivery_status (`held` | `delivered` | `failed`), created_at, delivered_at)`. Contact details are encrypted at rest and never appear in logs or workflow history (section 6.5), `held` means no `escalation_contact` is set (section 8.3), and a takedown deletes a business's leads (section 11).
+
+Raw HTML and cleaned text live in object storage (`crawl_pages.raw_path` is an object key, keyed by `job_id` and kept that way after the `business_id` is allocated so a takedown can find it). Pre-migration backups (section 4.5) also live there, keyed by `business_id` and version. Temporal keeps its own state in a separate Postgres database, never in the app database. Redis holds only caches and rate-limit counters (section 3) and is never a source of truth.
+
+**Indexes**
+- B-tree on `website_norm`, `publication_status`, `next_refresh_at`, and `source_evidence(job_id)` and `(business_id, field_path)`.
+- GIN on `doc`, on `search_tsv`, and a trigram index (`pg_trgm`) on `name_norm`; a vector index on `business_embeddings`; GiST on `geo`.
+- The dedupe keys of section 4.4: unique on `(host, phone_norm)` where `phone_norm` is not null; unique on `(host, address_norm)` where `phone_norm` is null and `address_norm` is not null; unique on `place_id` where it is not null; and unique on `(phone_norm, name_norm)` where `host` is null and `phone_norm` is not null (listing-only). The host-only key has no index: the `resolving` stage checks it inside its transaction (section 4.4).
 
 ## 10. Owner claim flow (post-v1)
 
@@ -636,11 +652,11 @@ Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and
 
 - Business sites that allow indexing and have no opt-out signal MAY be set to `published` automatically, with an "unverified listing" label. A listing-only business (section 5) has no site to check for opt-out signals, so it is created as `draft` and is never auto-published; an admin publishes it in v1.
 - Sites with noindex/nofollow, a site-wide robots.txt disallow (for our user agent or `*`), or an explicit opt-out are `suppressed` (reason `opt_out`): not searchable or chattable, and the host is added to the suppression list. The full record is kept (suppressed) with only what was obtained before the signal, and the fallback ladder never runs (section 6.2). In v1 there is no opt-in path; owner opt-in comes with the claim flow (section 10).
-- Honor takedown requests: `POST /v1/takedown` (admin in v1) deletes the record, embeddings, raw pages, chat history, pre-migration backups, and every row keyed by that host's `job_id`s (including jobs that never allocated a `business_id`), and adds the host to the suppression list (and the `place_id`, when known) so it is not re-ingested. A takedown of a listing-only business, which has no host, adds its `place_id` and `phone_norm`. `phone_norm` is never added for a business with a site, since a shared or central number would block other locations.
+- Honor takedown requests: `POST /v1/takedown` (admin in v1) deletes the record, embeddings, facets, raw pages, chat history, leads, pre-migration backups, and every row keyed by that host's `job_id`s (including jobs that never allocated a `business_id`), and adds the host to the suppression list (and the `place_id`, when known) so it is not re-ingested. A takedown of a listing-only business, which has no host, adds its `place_id` and `phone_norm`. `phone_norm` is never added for a business with a site, since a shared or central number would block other locations.
 - Before any ingest step, including the fallback ladder, check the suppression list and the host's opt-out signals (section 5.1).
 - Store per-source licenses, Places API data, and search-provider results only as their terms allow. Keep an audit log of what came from which source and ladder step.
 - **SSRF protection (MUST)**: block private, loopback, link-local, and cloud-metadata IPs; re-check after redirects; limit size and time; http/https only.
-- **Takedown runs as a workflow** (section 6.5): delete the record, embeddings, raw pages, chat history, pre-migration backups, and any ingest-job rows (found by `business_id` or by host), add the suppression keys (host and `place_id`, or `place_id` and `phone_norm` for a listing-only business), and retry each step until it succeeds. Because workflows carry references rather than business data, histories hold nothing to purge; set a finite history retention anyway.
+- **Takedown runs as a workflow** (section 6.5): delete the record, embeddings, facets, raw pages, chat history, leads, pre-migration backups, and any ingest-job rows (found by `business_id` or by host), add the suppression keys (host and `place_id`, or `place_id` and `phone_norm` for a listing-only business), and retry each step until it succeeds. Because workflows carry references rather than business data, histories hold nothing to purge; set a finite history retention anyway.
 - SSRF checks (below) run inside every crawl activity, including after redirects.
 - Auth on admin endpoints and on the Temporal UI (never exposed publicly); secrets via environment; no PII in logs; log LLM calls with `business_id`, token counts, latency.
 
