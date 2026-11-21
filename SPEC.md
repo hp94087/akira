@@ -148,9 +148,16 @@ Anything useful that no profile field fits goes here, so nothing is lost:
 
 ### 4.4 Entity identity and franchises
 
-- `business_id` = `biz_<slug>_<locale-code>`, numeric suffix on collision.
-- Dedupe key = full hostname + normalized phone, never registrable domain alone (franchise sites often use per-city subdomains).
-- `parent_brand` (nullable): `{ "name": "...", "website": "...", "nationwide_claims": ["26,000+ families nationwide"] }`. Brand-level claims are stored here, not mixed into the local entity's facts. The agent speaks as the local entity and only cites brand claims when attributed to the brand.
+- **`business_id`** = `biz_<slug>_<locale-code>`, with a numeric suffix on collision.
+  - Allocated once, at the end of extraction (the name and locale are not known earlier), and never changed afterward, whatever happens to the name, domain, or locale.
+  - Allocation is atomic: insert under the `business_id` primary key and retry with the next suffix on conflict, so concurrent ingests cannot take the same ID.
+  - `POST /v1/ingest` therefore returns `business_id` only when the record already exists (a re-ingest). For a new business it is `null` and is reported by `GET /v1/ingest/{job_id}` once allocated.
+- **Identity in two stages.**
+  1. *At start* only the URL is known. The workflow ID is `ingest-{normalized_url}` (lowercase host plus path, no query or fragment), which rejects a concurrent duplicate. Two locations on one host have different paths and do not block each other.
+  2. *After extraction* the record is resolved against existing ones by the first key that is available, in this order: full hostname + normalized phone; full hostname + normalized address; full hostname alone. A match merges into the existing record (the `business_id` is kept).
+- **Never the registrable domain alone** (franchise sites often use per-city subdomains).
+- **When the phone and address are both null,** the host-only key is used only if the host has no other record. Otherwise the record is created as a new entity and flagged `identity_ambiguous` in `warnings[]` for admin review. The pipeline never silently merges two possible locations.
+- `parent_brand` (nullable): `{ "name": "...", "website": "...", "nationwide_claims": [{ "text": "26,000+ families nationwide", "source_url": "...", "retrieved_at": "...", "origin": "business" }] }`. Brand-level claims are stored here, not mixed into the local entity's facts. Each claim carries provenance like any other field. They are self-published marketing, so they are never used to support offers, guarantees, or prices (consistent with section 4.3). The agent speaks as the local entity and only cites brand claims when attributed to the brand.
 
 ### 4.5 Versioning and migration
 
@@ -202,7 +209,7 @@ Rules:
 
 ### 6.1 API
 
-- `POST /v1/ingest { "url": "...", "options": { "max_pages": 15, "force_refresh": false } }` starts an ingest workflow (section 6.5) and returns `202 { "job_id", "business_id" }`. `job_id` is the workflow ID
+- `POST /v1/ingest { "url": "...", "options": { "max_pages": 15, "force_refresh": false } }` starts an ingest workflow (section 6.5) and returns `202 { "job_id", "business_id" }` (`business_id` is `null` for a new business until it is allocated, section 4.4). `job_id` is the workflow ID
 - `GET /v1/ingest/{job_id}`: read from the workflow state (section 6.5): status (`queued | crawling | classifying | extracting | enriching | validating | indexed | failed`; `enriching` is the fallback ladder, section 5.1), stage timings, warnings
 - `GET /v1/businesses/{business_id}`, `POST /v1/businesses/{business_id}/refresh` (starts a refresh workflow)
 - `PATCH /v1/businesses/{business_id}`: admin edits (authenticated); sets `verification_status = "verified"`. Owner edits are post-v1
@@ -248,7 +255,7 @@ Rules:
 - **No I/O in workflow code.** HTTP, LLM, database, and search-provider calls are activities. Workflow code is deterministic. Activities set timeouts and retry policies, and long crawls heartbeat.
 - **Stage mapping.** The ingest job statuses in 6.1 map one-to-one to workflow stages.
 - **Small payloads.** Workflows pass references (`business_id`, page IDs, object-storage keys), never raw HTML or full documents. This keeps PII and business data out of workflow history.
-- **Workflow ID is the dedupe key.** `ingest-{host}-{phone_norm}` (section 4.4) with a reuse policy that rejects a concurrent duplicate. `force_refresh` starts a new run.
+- **Workflow ID is the dedupe key at start.** `ingest-{normalized_url}` (section 4.4; phone-based resolution happens after extraction) with a reuse policy that rejects a concurrent duplicate. `force_refresh` starts a new run.
 - **First activity is the opt-out check.** It checks the suppression list and the host's opt-out signals (section 11) before any crawl or search-provider call. A suppressed host ends the workflow there.
 - **Politeness in the workflow layer.** robots.txt crawl-delay and per-host rate limits are enforced by the orchestration, not by worker concurrency.
 - **Separate task queues.** Playwright crawling runs on its own browser task queue and workers, so heavy rendering cannot starve LLM or API activities.
@@ -422,7 +429,7 @@ With an active set, the panel offers one tab per agent plus an "Ask all" tab. An
 
 ## 9. Data store (Postgres)
 
-- `businesses(business_id PK, host, phone_norm, doc JSONB, core_version, profile_ref, verification_status, publication_status, geo, created_at, updated_at, last_verified_at)`
+- `businesses(business_id PK, host, phone_norm, address_norm, doc JSONB, core_version, profile_ref, verification_status, publication_status, geo, created_at, updated_at, last_verified_at)`
 - `business_embeddings(business_id, view, embedding vector, doc_version)`
 - `service_areas(business_id, kind, value)` for city/ZIP matching
 - `source_evidence(id, business_id, field_path, value, source, method, confidence, retrieved_at, ladder_step, origin)`
@@ -436,7 +443,7 @@ With an active set, the panel offers one tab per agent plus an "Ask all" tab. An
 
 Raw HTML and cleaned text live in object storage (`crawl_pages.raw_path` is an object key). Temporal keeps its own state in a separate Postgres database, never in the app database.
 
-Indexes: GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, B-tree on `(host, phone_norm)`.
+Indexes: GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, unique on `(host, phone_norm)` where `phone_norm` is not null, unique on `(host, address_norm)` where `phone_norm` is null and `address_norm` is not null (the dedupe keys of section 4.4).
 
 ## 10. Owner claim flow (post-v1)
 
@@ -549,7 +556,7 @@ README.md
 {
   "schema_version": "core-1.0",
   "business_id": "biz_ecoguard_pest_management_sunnyvale",
-  "parent_brand": { "name": "EcoGuard Pest Management", "website": null, "nationwide_claims": ["26,000+ families nationwide"] },
+  "parent_brand": { "name": "EcoGuard Pest Management", "website": null, "nationwide_claims": [{ "text": "26,000+ families nationwide", "source_url": "https://ecoguard.example/about", "retrieved_at": "2026-11-01T00:00:00Z", "origin": "business" }] },
   "identity": { "dba_name": "EcoGuard Pest Management", "tagline": null, "description": null, "categories": ["pest_control"], "brand_voice": "Reassuring, professional", "media": null },
   "location": {
     "presence": "service_area",
