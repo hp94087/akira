@@ -161,10 +161,49 @@ Anything useful that no profile field fits goes here, so nothing is lost:
 
 ### 4.5 Versioning and migration
 
-- Core and each profile have independent semantic versions. Each record stores `schema_version` and `profile.schema_ref`.
-- `/schemas/migrations/` holds small pure functions `core_1_1_to_1_2.py`, etc. Records migrate lazily on read and via a background job.
-- Because raw page snapshots are stored (section 6.2), a profile change can trigger re-extraction without re-crawling.
-- A schema change MUST pass the fixture tests in section 12 before it is deployed.
+**Versions.**
+- Core and each profile have independent semantic versions. A record stores `schema_version` (for example `core-1.0`) and `profile.schema_ref` (for example `profiles/restaurant@1.0`). The `businesses` table mirrors them in `core_version` and `profile_ref`.
+- A **minor** version is additive: a new nullable field or a new enum value, with no change to existing data. A **major** version is breaking: a rename, removal, retype, or change of meaning. Every version step has a migration file, even if it only sets defaults.
+- A profile's schema and manifest share one version (`restaurant@1.1.json` and `restaurant@1.1.manifest.json`). Any manifest change (facets, `freshness`, `source_restrictions`, `description`, `embed_template`, `starter_questions`, `intent_hints`) bumps the profile version, even when the schema is unchanged.
+
+**What a change triggers.**
+
+| Change | Migration | Rebuild |
+|---|---|---|
+| Schema field added (minor) | defaults to `null` | reindex facets if it is a facet |
+| Schema rename, removal, or retype (major) | required | reindex, re-embed, migrate provenance |
+| Facet added, removed, or retyped | none | reindex facets |
+| `embed_template` changed | none | re-embed that view |
+| `freshness` or `source_restrictions` changed | none | re-evaluate staleness (section 6.5 refresh) and re-validate |
+| `description` changed | none | re-run classification evals (section 12) |
+| New facts needed from existing sources | none | re-extraction (below) |
+
+**Migration files.**
+- Location: `/schemas/migrations/`, named `core_<from>_to_<to>.py` and `<profile>_<from>_to_<to>.py` (for example `core_1_0_to_1_1.py`, `restaurant_1_0_to_1_1.py`). Each exposes `migrate(doc: dict) -> dict`.
+- Rules:
+  - Pure, deterministic, and idempotent: running one twice gives the same result.
+  - Never invent values: new fields are `null`, and `null` is never turned into `false`.
+  - A path rename also rewrites the matching `system.field_provenance` keys and, in the same transaction, `source_evidence.field_path`, so evidence never points at a path that no longer exists.
+  - Preserved untouched: `business_id`, human edits and their provenance, knowledge entry `id`s, `publication_status`, and `access_status`.
+  - A record several versions behind runs the chain one step at a time. There is no skipping and no rollback; migrations are forward-only.
+- The runner validates the result against the target schema and fails the record (leaving it at its old version, with a warning) if validation fails.
+
+**When migration runs.**
+- **Write-through, never read-only.** A record migrated on read is saved in the same step: the new version, the updated provenance and evidence rows, and a queued reindex. This keeps a single shape in the database.
+- A background workflow (`/backend/app/workflows/migrate.py`) migrates the rest in batches, with a rate limit. Search indexes only records at the current core version and the profile version its manifest expects, and a record mid-migration stays in the index at its old version until the new one is indexed.
+- Before overwriting, the workflow keeps the pre-migration document in object storage, keyed by `business_id` and old version, until the next release is cut, so a bad migration can be repaired.
+- Retiring a version: CI blocks removing a schema, manifest, or migration file while any `businesses.core_version` or `businesses.profile_ref` still uses it.
+
+**Re-extraction.** A profile change that needs new data (a new field, a changed prompt) can re-extract from stored page snapshots (section 6.2) without re-crawling. It runs as a Temporal workflow per business (`reextract.py`) and follows these rules:
+- Merge by provenance priority (section 5): admin edits always win, and a re-extracted value never overwrites one.
+- Keep the original `retrieved_at` for every value, so old snapshot content is never presented as fresh. Fields past `freshness.max_age` are queued for the normal refresh instead.
+- Skip any business with no snapshots (for example after a takedown) and any `suppressed` one.
+- Bound cost: batch size, a rate limit, and a per-run LLM budget.
+- Re-validate against the publication rules in section 11 before the new version goes live. The record keeps serving its old version until then.
+
+**Reclassification.** A change of `profile.type` (for example `generic` to `restaurant`) is not a version migration. It is a re-extraction against a different profile schema. It follows the re-extraction rules above, plus: the old `profile.data` is kept until the new one validates, and provenance entries under the old profile paths are removed only after the switch.
+
+**Release gate.** A schema or manifest change MUST pass the checks in section 12 before it is deployed, and a pull request that changes a schema ships with its migration file and updated fixtures.
 
 ## 5. Source adapters and discovery
 
@@ -469,7 +508,7 @@ Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and
 
 ## 12. Testing and evaluation
 
-- **Schema fixtures**: every profile ships with 3+ example JSON fixtures (including a sparse one with mostly nulls and tri-state booleans left null). CI validates them against core + profile and runs migrations on old fixtures. CI also validates each manifest: `description` is present and within the length limit, every facet `path` exists in the profile schema with a matching `type`, and every `freshness` and `source_restrictions` path exists. Fixtures include a stale time-sensitive field and a restricted field filled only by third-party evidence, and the checks must flag and reject them respectively. Knowledge fixtures include an entry with full provenance, an FAQ marked `llm_inferred`, and a third-party price in `knowledge.facts` that validation must reject. CI also checks that entry `id`s are unique within each list and that every knowledge entry has `source_url`, `retrieved_at`, and `origin`.
+- **Schema fixtures**: every profile ships with 3+ example JSON fixtures (including a sparse one with mostly nulls and tri-state booleans left null). CI validates them against core + profile and runs migrations on old fixtures: every migration is run on a fixture of its source version, the output must validate against the target schema, running it twice must give the same output, every `field_provenance` path in the output must resolve to a field, and `null` values, human edits, `business_id`, and knowledge `id`s must be unchanged. CI also fails if a schema or manifest change has no migration file or no updated fixtures, and if a version still used by a record is removed. CI also validates each manifest: `description` is present and within the length limit, every facet `path` exists in the profile schema with a matching `type`, and every `freshness` and `source_restrictions` path exists. Fixtures include a stale time-sensitive field and a restricted field filled only by third-party evidence, and the checks must flag and reject them respectively. Knowledge fixtures include an entry with full provenance, an FAQ marked `llm_inferred`, and a third-party price in `knowledge.facts` that validation must reject. CI also checks that entry `id`s are unique within each list and that every knowledge entry has `source_url`, `retrieved_at`, and `origin`.
 - **Extraction evals**: a golden set of 30+ real sites across at least 4 verticals (include a restaurant, a service-area business, a franchise subdomain, and a thin one-page site), with hand-labeled JSON. Report per-field precision/recall and profile-classification accuracy. Verify absent data stays null and is never `false`. Gate merges on no regression.
 - **Fallback-ladder evals**: simulated blocked sites (bot protection, JS wall, rate limit). Verify the ladder order, the stop-at-sufficient-confidence rule, `ladder_step` and `origin: third_party` on search evidence, and that search-derived values are never accepted for offers, guarantees, or prices. Verify hosts with an opt-out signal or on the suppression list make zero search-provider calls. Verify the pipeline sends no spoofed headers, and that every ladder call, whichever provider, avoids live-fetching the target (for Exa, cache-only with no live crawl parameters).
 - **Durable-execution evals** (Temporal, section 6.5):
@@ -507,7 +546,7 @@ Payments, real booking integrations, voice, multi-language (schema supports it, 
   core@1.0.json
   /profiles   generic@1.0.json, restaurant@1.0.json, home_services@1.0.json, *.manifest.json
   /taxonomy   categories.json
-  /migrations
+  /migrations   core_<from>_to_<to>.py, <profile>_<from>_to_<to>.py (migrate(doc) -> dict)
   /fixtures   per-profile example JSON
 /chat
   capabilities.yaml
@@ -516,7 +555,7 @@ Payments, real booking integrations, voice, multi-language (schema supports it, 
   /ingest     adapters/ (website, places_api, open_data, search_api), ladder.py, crawler.py, cleaner.py, classifier.py, extractor.py, merger.py, normalizer.py, freshness.py
   /search     indexer.py, query_understanding.py, retrieve.py, rerank.py, location.py, session.py (active set), match_state.py
   /chat       prompt.py, registry.py, tools.py, runtime.py, guardrails.py, router.py, fanout.py
-  /workflows  ingest.py, discover.py, refresh.py (Schedules), reextract.py, takedown.py, lead_delivery.py
+  /workflows  ingest.py, discover.py, refresh.py (Schedules), reextract.py, migrate.py, takedown.py, lead_delivery.py
   /activities crawl.py, classify.py, extract.py, ladder.py, validate.py, index.py, optout_check.py
   /worker     main.py (task queues: default, browser)
   /api        ingest.py, search.py, chat.py, admin.py
