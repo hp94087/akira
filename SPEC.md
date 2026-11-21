@@ -108,10 +108,14 @@ Every field except identity name and `business_id` MUST be nullable. Absence is 
 
 Each profile is a JSON Schema file in `/schemas/profiles/` plus a small manifest `profiles/<name>@<ver>.manifest.json` declaring:
 
-- `facets`: which profile fields are searchable filters (e.g. `services`, `dietary`)
+- `facets`: which profile fields are searchable filters (e.g. `services`, `dietary`). Each facet declares its `path` (a `profile.data` path, which is also where chat-surfaced facts are written back, section 7.4), its `type` (`bool` | `enum` | `list` | `number`), and whether it can be a `hard` filter. Match state (`match`, `partial`, `non_match`, `unknown`) is computed in code from these declarations, so no vertical-specific logic is needed
+- `freshness`: per field path, which fields are time-sensitive (for example `reservation_policy`) and their `max_age`. Stale values are hedged in chat and queued for refresh
+- `source_restrictions`: field paths that must not be filled from third-party or search-derived evidence (any field that can hold prices, offers, or guarantees)
 - `embed_template`: how to render profile data into text for embedding
 - `starter_questions`: suggested chat prompts for this vertical
 - `intent_hints`: which intents this vertical usually supports
+
+Profile schemas follow the core rules (section 4.1): every field is nullable, booleans are tri-state (`true`, `false`, or `null`), and `false` is emitted only when a source states it. Provenance is tracked per profile path, for example `profile.data.services`.
 
 Adding a vertical = adding these files. No pipeline, search, or chat code changes.
 
@@ -306,11 +310,11 @@ Active-set UI:
 - `unknown`: the data is silent or missing. This is the default, and it is never treated as a no.
 
 **Evaluation.**
-1. Structured requirements (open now, service area, price tier, facets) are evaluated in code against the JSON.
+1. Structured requirements (open now, service area, price tier, facets) are evaluated in code against the JSON. Profile facets are read from the `path` and `type` declared in the manifest (section 4.2), so no vertical-specific logic is needed.
 2. Free-text requirements are judged by an LLM over that one business's JSON. The judge must cite the supporting or contradicting data path. If it cannot cite one, the state is `unknown`.
 3. Search-derived (`third_party`) evidence can support `match` or `partial` only when labeled as such. It never supports `non_match` on its own.
 
-**Chat feeds search.** After every agent answer, in a single-business chat or a fan-out, a fact-extraction step reads that agent's answer and tool results (both derived from its JSON) and updates its row in the match state. A user's own claims never update match state. An "I don't know" answer leaves `unknown`.
+**Chat feeds search.** After every agent answer, in a single-business chat or a fan-out, a fact-extraction step reads that agent's answer and tool results (both derived from its JSON) and updates its row in the match state. When the fact maps to a declared facet, it is written to that facet's `path` with provenance (`origin` from the agent's own data). A user's own claims never update match state. An "I don't know" answer leaves `unknown`.
 
 **Match state store.** `search_sessions.match_state`: `{business_id: {requirement_id: {state, evidence_path, evidence_text, source: search|chat, updated_at}}}`.
 
@@ -449,7 +453,7 @@ Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and
 
 ## 12. Testing and evaluation
 
-- **Schema fixtures**: every profile ships with 3+ example JSON fixtures (including a sparse one with mostly nulls and tri-state booleans left null). CI validates them against core + profile and runs migrations on old fixtures.
+- **Schema fixtures**: every profile ships with 3+ example JSON fixtures (including a sparse one with mostly nulls and tri-state booleans left null). CI validates them against core + profile and runs migrations on old fixtures. CI also validates each manifest: every facet `path` exists in the profile schema with a matching `type`, and every `freshness` and `source_restrictions` path exists. Fixtures include a stale time-sensitive field and a restricted field filled only by third-party evidence, and the checks must flag and reject them respectively.
 - **Extraction evals**: a golden set of 30+ real sites across at least 4 verticals (include a restaurant, a service-area business, a franchise subdomain, and a thin one-page site), with hand-labeled JSON. Report per-field precision/recall and profile-classification accuracy. Verify absent data stays null and is never `false`. Gate merges on no regression.
 - **Fallback-ladder evals**: simulated blocked sites (bot protection, JS wall, rate limit). Verify the ladder order, the stop-at-sufficient-confidence rule, `ladder_step` and `origin: third_party` on search evidence, and that search-derived values are never accepted for offers, guarantees, or prices. Verify hosts with an opt-out signal or on the suppression list make zero search-provider calls. Verify the pipeline sends no spoofed headers, and that every ladder call, whichever provider, avoids live-fetching the target (for Exa, cache-only with no live crawl parameters).
 - **Durable-execution evals** (Temporal, section 6.5):
@@ -509,7 +513,7 @@ README.md
 
 ## 15. Delivery phases
 
-- **Phase 1: Schemas + ingest.** Temporal setup (server, workers, default and browser task queues), the ingest workflow and activities, core and the three initial profiles, schema loader, website adapter, fallback ladder (steps 1, 3, 4 with `search_api`), classifier, extractor, merger, normalizer, freshness policy, storage, CLI `ingest <url>` (starts a workflow), fixture tests, extraction and ladder evals, and the generalization test (new salon profile with zero code changes). Done when: 10 sites across at least 3 verticals produce valid JSON with provenance, an ingest survives a worker restart mid-run and resumes, a duplicate concurrent ingest is rejected, the ladder evals pass, and the generalization test passes.
+- **Phase 1: Schemas + ingest.** Temporal setup (server, workers, default and browser task queues), the ingest workflow and activities, core and the three initial profiles with manifests (facets, freshness, source restrictions) and manifest validation, schema loader, website adapter, fallback ladder (steps 1, 3, 4 with `search_api`), classifier, extractor, merger, normalizer, freshness policy, storage, CLI `ingest <url>` (starts a workflow), fixture tests, extraction and ladder evals, and the generalization test (new salon profile with zero code changes). Done when: 10 sites across at least 3 verticals produce valid JSON with provenance, an ingest survives a worker restart mid-run and resumes, a duplicate concurrent ingest is rejected, the ladder evals pass, and the generalization test passes.
 - **Phase 2: Chat.** Prompt compiler, capability registry, tools, SSE API for single-business chat, minimal chat page, chat evals. Done when: grounded answers, refusal on unknowns, no commitments or negatives from silence, correct tool gating across all test businesses.
 - **Phase 3: Search + active set.** Indexer, hybrid retrieval with service-area matching, query understanding with requirements, four-state hard-requirement evaluation, reranker, API, UI, search sessions with the active set and its endpoints. Done when: search evals and active-set evals meet section 12 targets.
 - **Phase 4: Refine through conversation.** Match state (section 7.4), chat-to-search feedback, router, fan-out, comparison, multi-agent chat UI, match-state and fan-out evals. Done when: the evals for match state and fan-out pass, including zero leakage and no silent widening.
