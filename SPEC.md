@@ -640,11 +640,36 @@ Raw HTML and cleaned text live in object storage (`crawl_pages.raw_path` is an o
 
 ## 10. Owner claim flow (post-v1)
 
-Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and no listing is claimed. Design intent for later:
+Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint (section 6.1), no listing is claimed, and an admin sets `verification_status` with `"verify": true`, which leaves `verification_details` null. Design intent for later:
 
-- Owner starts a claim for a listing and verifies control (email at the site's domain, phone call/SMS to the listed number, or a DNS/meta tag).
-- On success: `verification_status = "verified"`, owner can edit JSON, set `escalation_contact`, set `publication_status`, review held leads, and opt an excluded site back in. This is also when `verification_details`, `agent_status`, and `custom_instructions` arrive (section 4.1).
-- Owner edits are stored as owner evidence and win during merge.
+**Claim and verification**
+- An owner account starts a claim on one `business_id`. A claim attaches to a record and never changes its `business_id` (section 4.4). It is scoped to that record: control of a host or a brand does not give control of sibling locations, so a claim on a host with other records goes to admin review, and each location is claimed separately.
+- The owner proves control by one of: an email at the site's domain, a call or SMS to the record's `contact.phone`, a DNS TXT record or meta tag on the host (`domain_txt`), or another admin-reviewed method. A listing-only record has no host, so it can use only the phone or `other`.
+- `verification_status` moves `unverified` to `claimed` when a claim is submitted (a claim alone is not verification) and to `verified` when the proof and an identity check pass. `system.verification_details` records `ownership_method`, `identity_checked`, and `verified_at`. A `claims` table holds the claim state (owner, `business_id`, method, status, timestamps), and `takedowns` stays keys-only (section 9).
+- `verified` removes the "unverified listing" label and is the existing ranking boost (section 7.2). The "built from public listings" notice still follows `field_provenance`, not verification (section 8.4).
+
+**Owner edits**
+- A verified owner edits the JSON through the same validated merge-patch path as an admin, limited to their own record. Each changed path gets provenance `method: owner_edit`, `confidence: 1.0`, `origin: business`, `ladder_step: null`, and `edited_by` set to the owner's ID.
+- The never-editable paths stay the same (section 6.1): `business_id`, `schema_version`, `system.access_status`, `system.field_provenance`, `system.warnings`, `system.source_ids`. An owner also cannot edit `verification_status`.
+- Owner and admin edits rank above everything else in merge (section 5). Between the two, the later edit wins and both are kept in provenance. Re-extraction, refresh, and migration never overwrite an owner edit (sections 4.5 and 6.5).
+- An owner may fill restricted paths (`allowed_offers`, `price_tier`, `policies.*`), since the restriction is on third-party and search-derived evidence (section 4.1). `allowed_offers` still carries `terms_url` and `expires_at` when known. `parent_brand.nationwide_claims` stay attributed to the brand and never become local claims (section 4.4).
+- Adding a website to a listing-only record starts an ingest for that host. Resolution matches the existing record by `place_id` (section 4.4), so the `business_id` is kept, the `listing_only` warning clears, and the usual opt-out checks run on the new host.
+
+**Publication and opt-in**
+- A verified owner can set `publication_status` to `published` or `draft`, but never un-suppress a record directly. A verified owner of a listing-only record can publish it, since the owner's consent replaces the opt-out check that a record without a site cannot have (section 11).
+- **Opt-in for an excluded site** requires a verified claim and then the signal to be gone. For a site-wide disallow or noindex/nofollow, the owner removes it from the site and the pipeline re-checks it. For an explicit opt-out, the verified claim clears it. The `opt_out` suppression-list key is then removed, a full ingest runs (the suppressed record holds almost nothing, section 6.2), and `access_status` is set to `open` by the pipeline, never by hand. A host removed by a takedown (reason `takedown`) needs an admin to remove the key first.
+- An owner can request a takedown of their own record through the same workflow (section 11).
+
+**Agent controls**
+- `agent_status` (`disabled` | `draft` | `published`) gates chat. Chat needs `publication_status = published` and `agent_status = published`. A `disabled` or `draft` agent stays searchable, shows "chat unavailable", gets no tab, and is excluded from fan-out (sections 8.5 and 8.6). It can stay in the active set for search.
+- `custom_instructions` (owner-written, length-capped) are appended to the system prompt below the rules and delimited. They may set tone and emphasis but never override the guardrails or principles (no quoted prices, bookings, guarantees, or promised callbacks), and the grounding check still applies (section 8.4). Facts belong in the JSON, not in instructions.
+- A `catalog` block and its `catalog_items` table (section 4.1) are owner-editable, with the same provenance and restricted-path rules.
+
+**Leads**
+- Held leads (section 8.3) are released to the owner only after verification and a confirmed `escalation_contact`. Delivery runs as the `lead-{lead_id}` workflow carrying only the id (section 6.5). An owner sees only leads for their own `business_id`, and the user's pre-capture notice (section 8.4) already says contact details go to this one business.
+- Fan-out chat still never captures a lead (section 8.6).
+
+**Rollout.** The claim flow ships as a new core version plus a migration (section 4.5) that adds the `claimed` value, `verification_details`, `agent_status`, `custom_instructions`, and the `catalog` block, all nullable, and with the migration preserving owner edits. Its evals are added to section 12 when the flow is built.
 
 ## 11. Publication and compliance
 
