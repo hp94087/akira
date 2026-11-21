@@ -83,7 +83,7 @@ Fields every business has. Search, cards, and the chat shell depend only on thes
 - `policies` (nullable): `returns`, `delivery_shipping`, `cancellation_refund`, `warranty_guarantee`, each `{ summary, url }` and each nullable. Provenance is tracked per path, for example `policies.returns.summary`
 - `capabilities_and_actions`: `supported_intents[]`, `external_links{}` (the only store for links the agent may share, for example `contact_form`, `offers`, `order`)
 - `agent_guardrails`: `allowed_offers[]` (objects: `text`, `terms_url`, `expires_at`), `prohibited_actions[]`, `fallback_message`
-- `system`: `verification_status` (`unverified` | `verified`), `publication_status` (`draft` | `published` | `suppressed`; section 11), `access_status` (`open` | `technical_block` | `explicit_opt_out`; recorded by ingest, never edited by hand; `explicit_opt_out` leads to `suppressed`, `technical_block` does not), `last_verified_at`, `field_provenance{}` (keyed by core and profile field path; see Provenance below), `warnings[]` (see 5.1)
+- `system`: `verification_status` (`unverified` | `verified`), `publication_status` (`draft` | `published` | `suppressed`; section 11), `access_status` (`open` | `technical_block` | `explicit_opt_out`; recorded by ingest, never edited by hand; `explicit_opt_out` leads to `suppressed`, `technical_block` does not), `source_ids` (nullable: `places_place_id`), `last_verified_at`, `field_provenance{}` (keyed by core and profile field path; see Provenance below), `warnings[]` (see 5.1)
 
 Every field except `schema_version`, `business_id`, and `identity.dba_name` MUST be nullable. Absence is normal and the pipeline must handle it.
 
@@ -162,7 +162,7 @@ Anything useful that no profile field fits goes here, so nothing is lost:
   - `POST /v1/ingest` therefore returns `business_id` only when the record already exists (a re-ingest). For a new business it is `null` and is reported by `GET /v1/ingest/{job_id}` once allocated.
 - **Identity in two stages.**
   1. *At start* only the URL is known. The workflow ID is `ingest-{normalized_url}` (lowercase host plus path, no query or fragment), which rejects a concurrent duplicate. Two locations on one host have different paths and do not block each other.
-  2. *After extraction* the record is resolved against existing ones by the first key that is available, in this order: full hostname + normalized phone; full hostname + normalized address; full hostname alone. A match merges into the existing record (the `business_id` is kept).
+  2. *After extraction* the record is resolved against existing ones by the first key that is available, in this order: full hostname + normalized phone; full hostname + normalized address; full hostname alone. A listing-only business (section 5) has no host and uses `source_ids.places_place_id`, then normalized phone + normalized name. A match merges into the existing record (the `business_id` is kept).
 - **Never the registrable domain alone** (franchise sites often use per-city subdomains).
 - **When the phone and address are both null,** the host-only key is used only if the host has no other record. Otherwise the record is created as a new entity and flagged `identity_ambiguous` in `warnings[]` for admin review. The pipeline never silently merges two possible locations.
 - `parent_brand` (nullable): `{ "name": "...", "website": "...", "nationwide_claims": [{ "text": "26,000+ families nationwide", "source_url": "...", "retrieved_at": "...", "origin": "business" }] }`. Brand-level claims are stored here, not mixed into the local entity's facts. Each claim carries provenance like any other field. They are self-published marketing, so they are never used to support offers, guarantees, or prices (consistent with section 4.3). The agent speaks as the local entity and only cites brand claims when attributed to the brand.
@@ -215,19 +215,39 @@ Anything useful that no profile field fits goes here, so nothing is lost:
 
 ## 5. Source adapters and discovery
 
-Ingestion is a set of adapters writing into the same pipeline. Each adapter returns normalized evidence (`{field_path, value, source, method, confidence, retrieved_at, origin}`), and a merge step reconciles it.
+Ingestion is a set of adapters writing into the same pipeline. A merge step reconciles what they return.
+
+**Evidence contract.** Each adapter returns a list of evidence records: `{ field_path, value, source_url, source, method, confidence, retrieved_at, ladder_step, origin }`. `source` is the adapter name, and `source_url` is the page or API record the value came from (for an API, a stable URL or record ID). Records are stored in `source_evidence` (section 9) with the `job_id` and, once allocated, the `business_id` (section 4.4).
+
+**Adapter interface.** An adapter is a module in `/backend/app/ingest/adapters/` plus an entry in `/config/adapters.yaml`. It declares:
+- `name` and `ladder_step` (`website` is 1, `places_api` and `open_data` are 2, `search_api` is 3 in `site` mode and 4 in `broad` mode).
+- `covers`: the field paths it can fill. The ladder reads this to decide whether step 2 applies to a field.
+- `fetch(target) -> evidence[]`.
+- `license`: `{ terms_url, storable_fields, cache_ttl, attribution, reviewed_on }`.
+
+A write guard in the pipeline enforces `license`: it drops evidence for any field not in `storable_fields`, and a stored value past `cache_ttl` is set to `null`, flagged in `system.warnings[]`, and queued for refresh. Defaults follow the most restrictive reading. For `places_api` only `place_id` is storable until a human reviews the current terms and records `reviewed_on` and the allowed fields in the config. Until then Places data is used only transiently (for discovery and entity checks) and is not persisted, so step 2 through `places_api` is inactive.
 
 | Adapter | Use | Notes |
 |---|---|---|
 | `website` | Crawl the business's own site | Primary source; see section 6 |
-| `places_api` | Official Google Places API for discovery and basics (name, address, phone, hours) | MUST use the official API. Check current terms before storing anything beyond `place_id`; honor caching limits and attribution requirements |
+| `places_api` | Official Google Places API for discovery and basics (name, address, phone, hours) | MUST use the official API. Honor the `license` config: caching limits and attribution requirements |
 | `owner` | Owner claims a listing, pastes URL, edits JSON | Post-v1 (section 10). In v1, admin edits play this role; highest trust, overrides crawled data |
 | `open_data` | OpenStreetMap, business registries, other APIs with compatible terms | Record license per source |
 | `search_api` | Exa Search API (default) or Tavily, in `site` mode (domain-restricted) or `broad` mode | Fallback only (section 5.1). Lower trust; provider terms apply |
 
-- MUST NOT scrape Google Search, Maps, or Local Services result pages, or any site whose terms or robots.txt disallow automated access. If a submitted URL is an aggregator or results page (multiple businesses), the service returns an error explaining this and suggests discovery via `places_api` or submitting each business's own website.
-- **Discovery**: `POST /v1/discover { "query": "pest control", "location": "Sunnyvale, CA" }` uses `places_api` to list candidate businesses, then starts a child ingest workflow (section 6.5) for each candidate's own site.
-- **Merge priority**: admin/owner (admin only in v1) > structured data on the business's own site (JSON-LD) > site text > `places_api` > `open_data` > `search_api` (site mode) > `search_api` (broad mode) > LLM inference. Conflicts are recorded in `system.warnings`.
+An adapter that errors or is unavailable adds a `system.warnings[]` entry and its step is skipped. It never blocks the ingest (retries follow section 6.5).
+
+- MUST NOT scrape Google Search, Maps, or Local Services result pages, or any site whose terms or robots.txt disallow automated access.
+- **Aggregator and results pages.** `POST /v1/ingest` rejects a submitted URL with `422 { "error": "aggregator_url", "message", "suggestions" }` when its host is on the denylist in `/config/aggregators.json`, or when the page shows several businesses (more than 3 distinct `LocalBusiness` JSON-LD entities, or more than 5 distinct phone numbers; both thresholds configurable). An admin can override the page-signal check with `options.skip_aggregator_check`. The suggestions are discovery via `places_api` or submitting each business's own website.
+- **Discovery.** `POST /v1/discover { "query": "pest control", "location": "Sunnyvale, CA", "radius_km": 25, "max_candidates": 20 }` (defaults shown; `max_candidates` is capped at 50) starts a parent workflow (ID `discover-{hash(query, location, radius_km)}`, which rejects a concurrent duplicate) and returns `202 { "discovery_id", "candidate_count" }`, where `candidate_count` is `null` until the Places search finishes (the status endpoint reports it). The workflow pages through Places results until `max_candidates` is reached. `GET /v1/discover/{discovery_id}` returns each candidate as `{ name, place_ref, status, job_id, business_id }`, where `status` is `queued`, `ingesting`, `done`, `failed`, `listing_only`, `skipped_existing`, `skipped_suppressed`, or `skipped_no_source`.
+  - **Pre-checks, before any child workflow or crawl.** A candidate that matches an existing record by the keys of section 4.4 (`place_id`; host + normalized phone; or normalized phone + normalized name) is `skipped_existing` (unless `force_refresh`). A host alone is not a match, so sibling locations on one host are all ingested. One that matches the suppression list (by host, `place_id`, or `phone_norm`; section 11) is `skipped_suppressed`. Each candidate's website goes through the aggregator check above; if it fails (for example a Facebook or Yelp page), the candidate is treated as having no website and becomes listing-only.
+  - **Cost bounds.** `max_candidates`, at most 5 child ingests running at once (configurable), a per-discovery cap on search-provider calls (default 100, in `/config/ladder.yaml`), and the per-host rate limits in section 6.5.
+  - **Terms.** Only fields allowed by the `places_api` `license` are stored. If the allowed fields are not enough to build a record (no storable name or phone), a candidate without a website is `skipped_no_source`.
+- **Listing-only businesses** (a candidate with no website). The record is built from `places_api` evidence (step 2) and broad search (step 4); step 1 and step 3 need a site. It has `contact.website = null`, a `system.warnings[]` entry `listing_only`, and the "built from public listings" label. With no site there are no opt-out signals to check, so it is created as `draft` and an admin must publish it in v1. It is identified by `system.source_ids.places_place_id`, then `phone_norm` + normalized name (section 4.4), and its takedowns are recorded by `place_id` and `phone_norm` (section 11).
+- **Merge priority**: admin/owner (admin only in v1) > structured data on the business's own site (JSON-LD) > site text > `places_api` > `open_data` > `search_api` (site mode) > `search_api` (broad mode) > LLM inference. Every conflict is recorded in `system.warnings`.
+  - **Freshness.** When a new run is merged into an existing record, for time-sensitive fields (section 4.1, and `freshness` in manifests), if the existing higher-ranked value is stale (past `max_age`) and a newly fetched lower-ranked value from step 2 is fresh, the fresher value wins and the conflict is recorded. Admin edits are exempt and always win (section 4.5). Search-derived values never win on freshness.
+  - **Identity keys.** If sources disagree on `contact.phone` or `location.address` (the keys in section 4.4), both values are recorded, the higher-priority one is kept, and a `identity_conflict` warning is added. If the conflict leaves two possible matches in identity resolution, the record is flagged `identity_ambiguous`.
+- **Attribution.** The "built from public listings" notice includes the `license.attribution` text of every adapter that appears in the record's `field_provenance` (for example the OpenStreetMap credit, and the Places attribution where its terms require one).
 
 ### 5.1 Fallback ladder
 
@@ -242,12 +262,20 @@ For each field the pipeline still needs after the primary pass, work down the la
 
 Rules:
 
-- **Opt-outs are checked before any step runs.** A host with a robots.txt disallow, noindex/nofollow, an explicit opt-out, or an entry on the suppression list skips the whole ladder, including steps 3 and 4 (section 11).
+- **Opt-outs are checked before any step runs.** A host with a robots.txt disallow, noindex/nofollow, an explicit opt-out, or an entry on the suppression list skips the whole ladder, including steps 3 and 4 (section 11). A listing-only candidate is checked against the suppression list by `place_id` and `phone_norm`.
 - **Technical blocks are not opt-outs.** A block sends ingest down the ladder. Steps 3 and 4 use only the provider's licensed API output and never contact the blocked site. The pipeline never evades a block on the site itself: no user-agent spoofing, proxy rotation, CAPTCHA solving, or cached and archived copies.
 - **Exa request shape.** Both modes request `contents: { "highlights": true }` and MUST be served from Exa's cache only (`contents.maxAgeHours: -1`, or `type: "lite"`), so the provider never live-crawls the target. Never set `maxAgeHours` to `0` or a positive value, `livecrawl`, or `livecrawlTimeout` on ladder calls. Site mode sets `includeDomains` to the target host; broad mode sets no domain filter.
 - **Tavily (alternative).** Tavily uses its own request shape (for example `include_domains` for site mode). A provider is eligible for step 3 only if it can be configured to return results without live-fetching the target. Verify this for Tavily before enabling it, and until verified use Tavily for step 4 only. The same evidence, trust, and audit rules apply to every provider.
 - **Search evidence is lower trust.** It records `ladder_step`, the source URL, and `method`; it is marked `origin: third_party` when it is not the business's own words; and it ranks below steps 1 and 2 in merge. The merger MUST reject search-derived values for `allowed_offers`, guarantees (`policies.warranty_guarantee`), and prices.
 - **Honor provider terms** on storing and reusing results. Store only what the terms allow; keep an audit entry (provider, query, timestamp) per call.
+- **Wanted fields only.** Steps 2 to 4 run only for fields in the wanted set: the list in `/config/ladder.yaml` (by default `contact.phone`, `location.address`, `location.service_area`, `operations.hours_structured`, `operations.timezone`) plus the facet paths of the chosen profile's manifest. Restricted paths never go to steps 3 and 4, since search-derived values are rejected for them anyway: the core paths in section 4.1, each manifest's `source_restrictions` (section 4.2), and the restricted categories in `knowledge` (section 4.3).
+- **Bounded cost.** At most 10 search-provider calls per job (configurable in `/config/ladder.yaml`), with the missing fields batched into one query per step where possible. When the cap is reached, the ladder stops with a `ladder_budget_exhausted` warning.
+- **Still empty stays null.** A field the whole ladder could not fill is `null` (unknown), never guessed.
+- **Entity verification for search results.** Search values are accepted only if their source is about the target business.
+  - *Step 3* is scoped to the target's domain, so a result is accepted by default. On a host with sibling locations (more than one record on the host, or a locations page), the result must also match the target's locality or phone.
+  - *Step 4* is not scoped, so a result must match the normalized name (fuzzy, above a configured threshold) and either the locality or the phone.
+  - A result that fails is discarded, and the audit entry records `entity_mismatch`. This keeps another business's facts out of the record.
+  - If the target has neither a locality nor a phone, step 4 is skipped with an `entity_unverifiable` warning, since nothing could be verified.
 - Snippets are untrusted content: apply the prompt-injection hygiene in section 6.3.
 - Record the outcome on the document: `system.access_status` (`open`, `technical_block`, or `explicit_opt_out`) and a `system.warnings[]` entry for each block, skipped step, or low-confidence fill. Which steps filled which fields is in `field_provenance.ladder_step`; there is no separate list.
 - Log, per job, which step filled each field. These counts feed the fallback-ladder evals (section 12).
@@ -258,6 +286,7 @@ Rules:
 
 - `POST /v1/ingest { "url": "...", "options": { "max_pages": 15, "force_refresh": false } }` starts an ingest workflow (section 6.5) and returns `202 { "job_id", "business_id" }` (`business_id` is `null` for a new business until it is allocated, section 4.4). `job_id` is the workflow ID
 - `GET /v1/ingest/{job_id}`: read from the workflow state (section 6.5): status (`queued | crawling | classifying | extracting | enriching | validating | indexed | failed`; `enriching` is the fallback ladder, section 5.1), stage timings, warnings
+- `POST /v1/ingest` rejects an aggregator or results-page URL with `422 aggregator_url` (section 5). Discovery uses `POST /v1/discover` and `GET /v1/discover/{discovery_id}` (section 5).
 - `GET /v1/businesses/{business_id}`, `POST /v1/businesses/{business_id}/refresh` (starts a refresh workflow)
 - `PATCH /v1/businesses/{business_id}`: admin edits (authenticated); sets `verification_status = "verified"`. Owner edits are post-v1
 
@@ -303,7 +332,7 @@ Rules:
 - **Stage mapping.** The ingest job statuses in 6.1 map one-to-one to workflow stages.
 - **Small payloads.** Workflows pass references (`job_id` until the `business_id` is allocated, then `business_id`; page IDs, object-storage keys), never raw HTML or full documents. This keeps PII and business data out of workflow history.
 - **Workflow ID is the dedupe key at start.** `ingest-{normalized_url}` (section 4.4; phone-based resolution happens after extraction) with a reuse policy that rejects a concurrent duplicate. `force_refresh` starts a new run.
-- **First activity is the opt-out check.** It checks the suppression list and the host's opt-out signals (section 11) before any crawl or search-provider call. A suppressed host ends the workflow there.
+- **First activity is the opt-out check.** It checks the suppression list (by host, `place_id`, and `phone_norm`) and the host's opt-out signals (section 11) before any crawl or search-provider call. A suppressed host ends the workflow there.
 - **Politeness in the workflow layer.** robots.txt crawl-delay and per-host rate limits are enforced by the orchestration, not by worker concurrency.
 - **Separate task queues.** Playwright crawling runs on its own browser task queue and workers, so heavy rendering cannot starve LLM or API activities.
 - **Ladder activities enforce section 5.1.** A ladder activity rejects any provider request that could live-fetch the target (for Exa, any live-crawl parameter).
@@ -476,13 +505,14 @@ With an active set, the panel offers one tab per agent plus an "Ask all" tab. An
 
 ## 9. Data store (Postgres)
 
-- `businesses(business_id PK, host, phone_norm, address_norm, doc JSONB, core_version, profile_ref, verification_status, publication_status, geo, created_at, updated_at, last_verified_at)`
+- `businesses(business_id PK, host, phone_norm, address_norm, place_id, doc JSONB, core_version, profile_ref, verification_status, publication_status, geo, created_at, updated_at, last_verified_at)`
 - `business_embeddings(business_id, view, embedding vector, doc_version)`
 - `service_areas(business_id, kind, value)` for city/ZIP matching
 - `source_evidence(id, job_id, business_id (null until allocated), field_path, value, source, method, confidence, retrieved_at, ladder_step, origin)`
 - `crawl_pages(id, job_id, business_id (null until allocated), url, retrieved_at, status, raw_path, clean_text, robots_directives)`
 - `search_api_calls(id, job_id, business_id (null until allocated), provider, mode, query, retrieved_at)` audit log for the fallback ladder
-- `suppression_list(host PK, reason, created_at)`
+- `suppression_list(key_type, key_value, reason, created_at, PK(key_type, key_value))` with `key_type` as `host`, `place_id`, or `phone_norm`
+- `discovery_candidates(discovery_id, place_ref, name, status, job_id, business_id (null until allocated))`: a projection of the discovery workflow for `GET /v1/discover/{discovery_id}`
 - `search_sessions(session_id PK, active_set JSONB (business_ids: auto top 5 + user_added), requirements JSONB, match_state JSONB, scope, created_at, updated_at)`
 - `chat_sessions(session_id PK, search_session_id, created_at)`, `chat_messages(… target_business_id)`
 - `ingest_jobs(job_id = workflow_id, url, host, business_id (null until allocated), status, stage_timings, warnings, started_at, finished_at)`: a projection of workflow state for the status API
@@ -490,7 +520,7 @@ With an active set, the panel offers one tab per agent plus an "Ask all" tab. An
 
 Raw HTML and cleaned text live in object storage (`crawl_pages.raw_path` is an object key). Temporal keeps its own state in a separate Postgres database, never in the app database.
 
-Indexes: GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, unique on `(host, phone_norm)` where `phone_norm` is not null, unique on `(host, address_norm)` where `phone_norm` is null and `address_norm` is not null (the dedupe keys of section 4.4).
+Indexes: GIN on `doc`, vector index, GiST on `geo`, GIN on `tsvector`, unique on `(host, phone_norm)` where `phone_norm` is not null, unique on `(host, address_norm)` where `phone_norm` is null and `address_norm` is not null (the dedupe keys of section 4.4), and unique on `place_id` where it is not null.
 
 ## 10. Owner claim flow (post-v1)
 
@@ -506,11 +536,11 @@ Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and
 
 - Business sites that allow indexing and have no opt-out signal MAY be set to `published` automatically, with an "unverified listing" label.
 - Sites with noindex/nofollow, a robots.txt disallow, or an explicit opt-out are `suppressed` (reason `opt_out`): not searchable or chattable, and the host is added to the suppression list. In v1 there is no opt-in path; owner opt-in comes with the claim flow (section 10).
-- Honor takedown requests: `POST /v1/takedown` (admin in v1) deletes the record, embeddings, raw pages, chat history, pre-migration backups, and every row keyed by that host's `job_id`s (including jobs that never allocated a `business_id`), and adds the host to a suppression list so it is not re-ingested.
+- Honor takedown requests: `POST /v1/takedown` (admin in v1) deletes the record, embeddings, raw pages, chat history, pre-migration backups, and every row keyed by that host's `job_id`s (including jobs that never allocated a `business_id`), and adds the host to the suppression list (and the `place_id`, when known) so it is not re-ingested. A takedown of a listing-only business, which has no host, adds its `place_id` and `phone_norm`. `phone_norm` is never added for a business with a site, since a shared or central number would block other locations.
 - Before any ingest step, including the fallback ladder, check the suppression list and the host's opt-out signals (section 5.1).
 - Store per-source licenses, Places API data, and search-provider results only as their terms allow. Keep an audit log of what came from which source and ladder step.
 - **SSRF protection (MUST)**: block private, loopback, link-local, and cloud-metadata IPs; re-check after redirects; limit size and time; http/https only.
-- **Takedown runs as a workflow** (section 6.5): delete the record, embeddings, raw pages, chat history, pre-migration backups, and any ingest-job rows (found by `business_id` or by host), add the host to the suppression list, and retry each step until it succeeds. Because workflows carry references rather than business data, histories hold nothing to purge; set a finite history retention anyway.
+- **Takedown runs as a workflow** (section 6.5): delete the record, embeddings, raw pages, chat history, pre-migration backups, and any ingest-job rows (found by `business_id` or by host), add the suppression keys (host and `place_id`, or `place_id` and `phone_norm` for a listing-only business), and retry each step until it succeeds. Because workflows carry references rather than business data, histories hold nothing to purge; set a finite history retention anyway.
 - SSRF checks (below) run inside every crawl activity, including after redirects.
 - Auth on admin endpoints and on the Temporal UI (never exposed publicly); secrets via environment; no PII in logs; log LLM calls with `business_id`, token counts, latency.
 
@@ -518,7 +548,7 @@ Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and
 
 - **Schema fixtures**: every profile ships with 3+ example JSON fixtures (including a sparse one with mostly nulls and tri-state booleans left null). CI validates them against core + profile and runs migrations on old fixtures: every migration is run on a fixture of its source version, the output must validate against the target schema, running it twice must give the same output, every `field_provenance` path in the output must resolve to a field, and `null` values, human edits, `business_id`, and knowledge `id`s must be unchanged. CI also fails if a schema or manifest change has no migration file or no updated fixtures, and if a version still used by a record is removed. CI also validates each manifest: `description` is present and within the length limit, every facet `path` exists in the profile schema with a matching `type`, and every `freshness` and `source_restrictions` path exists. Fixtures include a stale time-sensitive field and a restricted field filled only by third-party evidence, and the checks must flag and reject them respectively. Knowledge fixtures include an entry with full provenance, an FAQ marked `llm_inferred`, and a third-party price in `knowledge.facts` that validation must reject. CI also checks that entry `id`s are unique within each list and that every knowledge entry has `source_url`, `retrieved_at`, and `origin`.
 - **Extraction evals**: a golden set of 30+ real sites across at least 4 verticals (include a restaurant, a service-area business, a franchise subdomain, and a thin one-page site), with hand-labeled JSON. Report per-field precision/recall and profile-classification accuracy. Verify absent data stays null and is never `false`. Gate merges on no regression.
-- **Fallback-ladder evals**: simulated blocked sites (bot protection, JS wall, rate limit). Verify the ladder order, the stop-at-sufficient-confidence rule, `ladder_step` and `origin: third_party` on search evidence, and that search-derived values are never accepted for offers, guarantees, or prices. Verify hosts with an opt-out signal or on the suppression list make zero search-provider calls. Verify the pipeline sends no spoofed headers, and that every ladder call, whichever provider, avoids live-fetching the target (for Exa, cache-only with no live crawl parameters).
+- **Fallback-ladder evals**: simulated blocked sites (bot protection, JS wall, rate limit). Verify the ladder order, the stop-at-sufficient-confidence rule, `ladder_step` and `origin: third_party` on search evidence, and that search-derived values are never accepted for offers, guarantees, or prices. Verify hosts with an opt-out signal or on the suppression list make zero search-provider calls. Verify wrong-entity search results (same name, different locality or phone) are discarded with `entity_mismatch`, that only wanted fields trigger steps 2 to 4, that restricted paths never reach steps 3 and 4, that the per-job call cap stops the ladder with a warning, and that a field left empty stays `null`. Verify the license write guard drops fields outside `storable_fields`. Verify aggregator and multi-business URLs are rejected with `aggregator_url`. Verify discovery skips existing and suppressed candidates with zero crawl and search calls, that a listing-only record is created as `draft` and never auto-published, that suppression by `place_id` and `phone_norm` is honored (and that a site takedown never adds a phone key), that sibling locations on one host are all ingested by discovery, that a Places website that is an aggregator page yields a listing-only record, that `entity_unverifiable` skips step 4, and that the per-discovery search-call cap holds. Verify the pipeline sends no spoofed headers, and that every ladder call, whichever provider, avoids live-fetching the target (for Exa, cache-only with no live crawl parameters).
 - **Durable-execution evals** (Temporal, section 6.5):
   - Kill a worker mid-ingest: the workflow resumes and finishes, with no duplicated writes.
   - A flaky activity (LLM, search provider, network) retries per its policy and succeeds, and a permanently failing one ends the job as `failed` with details.
@@ -557,6 +587,10 @@ Payments, real booking integrations, voice, multi-language (schema supports it, 
   /taxonomy   categories.json
   /migrations   core_<from>_to_<to>.py, <profile>_<from>_to_<to>.py (migrate(doc) -> dict)
   /fixtures   per-profile example JSON
+/config
+  adapters.yaml   per adapter: covers, ladder_step, license (storable_fields, cache_ttl, attribution)
+  ladder.yaml     wanted fields, call cap, confidence and entity-match thresholds
+  aggregators.json   denylist of aggregator hosts
 /chat
   capabilities.yaml
   prompt_template.md
@@ -577,11 +611,11 @@ README.md
 
 ## 15. Delivery phases
 
-- **Phase 1: Schemas + ingest.** Temporal setup (server, workers, default and browser task queues), the ingest workflow and activities, core and the three initial profiles with manifests (facets, freshness, source restrictions) and manifest validation, schema loader, website adapter, fallback ladder (steps 1, 3, 4 with `search_api`), classifier, extractor, merger, normalizer, freshness policy, storage, CLI `ingest <url>` (starts a workflow), fixture tests, extraction and ladder evals, and the generalization test (new salon profile with zero code changes). Done when: 10 sites across at least 3 verticals produce valid JSON with provenance, an ingest survives a worker restart mid-run and resumes, a duplicate concurrent ingest is rejected, the ladder evals pass, and the generalization test passes.
+- **Phase 1: Schemas + ingest.** Temporal setup (server, workers, default and browser task queues), the ingest workflow and activities, core and the three initial profiles with manifests (facets, freshness, source restrictions) and manifest validation, schema loader, adapter interface and license write guard, website adapter, fallback ladder (steps 1, 3, 4 with `search_api`), classifier, extractor, merger, normalizer, freshness policy, storage, CLI `ingest <url>` (starts a workflow), fixture tests, extraction and ladder evals, and the generalization test (new salon profile with zero code changes). Done when: 10 sites across at least 3 verticals produce valid JSON with provenance, an ingest survives a worker restart mid-run and resumes, a duplicate concurrent ingest is rejected, the ladder evals pass, and the generalization test passes.
 - **Phase 2: Chat.** Prompt compiler, capability registry, tools, SSE API for single-business chat, minimal chat page, chat evals. Done when: grounded answers, refusal on unknowns, no commitments or negatives from silence, correct tool gating across all test businesses.
 - **Phase 3: Search + active set.** Indexer, hybrid retrieval with service-area matching, query understanding with requirements, four-state hard-requirement evaluation, reranker, API, UI, search sessions with the active set and its endpoints. Done when: search evals and active-set evals meet section 12 targets.
 - **Phase 4: Refine through conversation.** Match state (section 7.4), chat-to-search feedback, router, fan-out, comparison, multi-agent chat UI, match-state and fan-out evals. Done when: the evals for match state and fan-out pass, including zero leakage and no silent widening.
-- **Phase 5: Discovery, compliance.** Places API adapter (ladder step 2) + `/discover`, publication states, takedown workflow, suppression list, lead delivery workflow, discovery workflow, auth, rate limits, SSRF tests, refresh Schedules (every 14 days or on demand, stale time-sensitive fields first), observability.
+- **Phase 5: Discovery, compliance.** Places API adapter (ladder step 2) + `/discover` with its pre-checks and listing-only records, publication states, takedown workflow, suppression list (host, `place_id`, `phone_norm`), lead delivery workflow, discovery workflow, auth, rate limits, SSRF tests, refresh Schedules (every 14 days or on demand, stale time-sensitive fields first), observability.
 
 ## 16. Questions to confirm before starting
 
