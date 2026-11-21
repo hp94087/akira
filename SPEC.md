@@ -108,6 +108,7 @@ Every field except identity name and `business_id` MUST be nullable. Absence is 
 
 Each profile is a JSON Schema file in `/schemas/profiles/` plus a small manifest `profiles/<name>@<ver>.manifest.json` declaring:
 
+- `description` (required, at most 300 characters): what the profile covers, in one or two sentences. The classifier (section 6.3) builds its choices from these descriptions, so `generic@1.0` states that it is for anything that fits no other profile
 - `facets`: which profile fields are searchable filters (e.g. `services`, `dietary`). Each facet declares its `path` (a `profile.data` path, which is also where chat-surfaced facts are written back, section 7.4), its `type` (`bool` | `enum` | `list` | `number`), and whether it can be a `hard` filter. Match state (`match`, `partial`, `non_match`, `unknown`) is computed in code from these declarations, so no vertical-specific logic is needed
 - `freshness`: per field path, which fields are time-sensitive (for example `reservation_policy`) and their `max_age`. Stale values are hedged in chat and queued for refresh
 - `source_restrictions`: field paths that must not be filled from third-party or search-derived evidence (any field that can hold prices, offers, or guarantees)
@@ -208,7 +209,7 @@ Rules:
 
 ### 6.3 Extraction (profile-aware, two-stage)
 
-1. **Classify**: the LLM reads the cleaned text and picks the best `profile.type` from the profile registry (or `generic`). Log low-confidence classifications and every generic fallback (these show which new profiles to build).
+1. **Classify**: the LLM reads the cleaned text and picks the best `profile.type` from the profile registry using each manifest's `description` (or `generic`). Log low-confidence classifications and every generic fallback (these show which new profiles to build).
 2. **Extract**: structured/tool output against core + the chosen profile's JSON Schema (loaded at runtime, so new profiles work without code changes). Per-page extraction, then merge/reconcile.
 
 - Fields not found are null. Never fabricate. Never turn silence into `false` (section 4.1).
@@ -453,7 +454,7 @@ Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and
 
 ## 12. Testing and evaluation
 
-- **Schema fixtures**: every profile ships with 3+ example JSON fixtures (including a sparse one with mostly nulls and tri-state booleans left null). CI validates them against core + profile and runs migrations on old fixtures. CI also validates each manifest: every facet `path` exists in the profile schema with a matching `type`, and every `freshness` and `source_restrictions` path exists. Fixtures include a stale time-sensitive field and a restricted field filled only by third-party evidence, and the checks must flag and reject them respectively.
+- **Schema fixtures**: every profile ships with 3+ example JSON fixtures (including a sparse one with mostly nulls and tri-state booleans left null). CI validates them against core + profile and runs migrations on old fixtures. CI also validates each manifest: `description` is present and within the length limit, every facet `path` exists in the profile schema with a matching `type`, and every `freshness` and `source_restrictions` path exists. Fixtures include a stale time-sensitive field and a restricted field filled only by third-party evidence, and the checks must flag and reject them respectively.
 - **Extraction evals**: a golden set of 30+ real sites across at least 4 verticals (include a restaurant, a service-area business, a franchise subdomain, and a thin one-page site), with hand-labeled JSON. Report per-field precision/recall and profile-classification accuracy. Verify absent data stays null and is never `false`. Gate merges on no regression.
 - **Fallback-ladder evals**: simulated blocked sites (bot protection, JS wall, rate limit). Verify the ladder order, the stop-at-sufficient-confidence rule, `ladder_step` and `origin: third_party` on search evidence, and that search-derived values are never accepted for offers, guarantees, or prices. Verify hosts with an opt-out signal or on the suppression list make zero search-provider calls. Verify the pipeline sends no spoofed headers, and that every ladder call, whichever provider, avoids live-fetching the target (for Exa, cache-only with no live crawl parameters).
 - **Durable-execution evals** (Temporal, section 6.5):
