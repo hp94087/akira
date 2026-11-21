@@ -4,7 +4,7 @@ Hand this file to a coding agent. Build in the phases in section 15. Ask before 
 
 ## 1. Goal
 
-- **Ingest**: a backend service takes a business URL (or a discovered listing), gathers data from permitted sources, and produces a structured Business JSON document.
+- **Ingest**: a backend service takes a business URL (or a discovered listing, including one with no website, which is built from public listings and held as a draft), gathers data from permitted sources, and produces a structured Business JSON document.
 - **Search**: a public webpage where people type natural-language queries (Exa.ai-style: "eco-friendly pest control in Sunnyvale, same-day", "vegan South Indian brunch open Sunday") and get ranked, relevant businesses.
 - **Chat**: from any result, the user can chat with that business. The agent is assembled on the fly from that business's JSON. No per-business code, training, or deployment.
 - **Refine through conversation (grounded search sessions)**: after the first search, the system selects the top 5 agents as the user's **active set**. From then on, the user can keep chatting and searching, and every follow-up (a refining search, a question to the agents, a comparison) is grounded only in the active set.
@@ -25,7 +25,7 @@ Hand this file to a coding agent. Build in the phases in section 15. Ask before 
 
 **Ingest**
 
-- **Crawl only what's permitted, and degrade through the fallback ladder (section 5.1).** For each missing field, work down the ladder and stop at the first source that fills it with sufficient confidence: the business's own permitted pages (llms.txt, sitemap, robots.txt-allowed paths), then official structured APIs (`places_api`, `open_data`), then site-scoped search snippets (Exa Search API by default, or Tavily as an alternative, restricted to the target domain and served without live-fetching it, used only when direct fetching fails for technical reasons such as bot protection, JS rendering, or rate limits), then broad search (press, news, or partner listings that mention the missing information).
+- **Crawl only what's permitted, and degrade through the fallback ladder (section 5.1).** For each missing wanted field (a configured set, with a cap on search calls), work down the ladder and stop at the first source that fills it with sufficient confidence: the business's own permitted pages (llms.txt, sitemap, robots.txt-allowed paths), then official structured APIs (`places_api`, `open_data`), then site-scoped search snippets (Exa Search API by default, or Tavily as an alternative, restricted to the target domain and served without live-fetching it, used only when direct fetching fails for technical reasons such as bot protection, JS rendering, or rate limits), then broad search (press, news, or partner listings that mention the missing information).
   - Search-derived evidence is lower trust: it carries its source URL and method, is marked `third_party` where it is not the business's own words, ranks below the first two sources in merge, and is never used for offers, guarantees, or prices.
   - The search steps MUST NOT be used to bypass an opt-out: not for hosts with a robots.txt disallow, noindex/nofollow, an explicit opt-out, or an entry on the suppression list.
   - Never evade technical blocks on the site itself: no user-agent spoofing, proxy rotation, CAPTCHA solving, or cached and archived copies. A block (bot protection, JS wall, rate limit) sends ingest down the ladder to the search steps, which use only the search provider's licensed API output and never contact the blocked site. A block is not treated as an opt-out; only the opt-out signals above are.
@@ -61,7 +61,8 @@ Hand this file to a coding agent. Build in the phases in section 15. Ask before 
 | Cache / rate limits | Redis, for caches (query understanding, compiled agent JSON) and per-IP/session rate limits only. Not a queue |
 | Object storage | S3-compatible (MinIO in dev) for raw page snapshots |
 | Database | PostgreSQL 16 + pgvector + pg_trgm; Business JSON in JSONB |
-| Schemas | JSON Schema files in `/schemas`, loaded at startup, validated with `jsonschema` |
+| Schemas | JSON Schema files in `/schemas`, loaded at startup, validated with `jsonschema`. `embed_template` (section 4.2) uses sandboxed Jinja2 |
+| Config | YAML and JSON files in `/config` (adapters, ladder, aggregator denylist), validated with Pydantic at startup |
 | Embeddings / LLM | Provider-agnostic interfaces; default Claude for extraction and chat; a small, cheap model for query understanding and routing |
 | Search API (ingest fallback) | Provider-agnostic interface; default Exa Search API, Tavily as an alternative (section 5.1) |
 | Frontend | Next.js (App Router) + TypeScript + Tailwind, SSE streaming chat |
@@ -304,7 +305,7 @@ Rules:
 2. **Extract**: structured/tool output against core + the chosen profile's JSON Schema (loaded at runtime, so new profiles work without code changes). Per-page extraction, then merge/reconcile.
 
 - Fields not found are null. Never fabricate. Never turn silence into `false` (section 4.1).
-- Fields still empty after the primary pass go through the fallback ladder (section 5.1).
+- Wanted fields still empty after the primary pass go through the fallback ladder (section 5.1). Other empty fields stay null.
 - Anything useful that fits neither core nor profile goes to `knowledge.facts`.
 - Derived fields (brand voice, default guardrails, supported intents, starter questions) are marked `llm_inferred` in provenance.
 - `supported_intents` is computed from evidence, not assumed. Examples: `check_hours` only if hours exist; `share_order_link` only if an ordering link exists; `capture_estimate_lead` for service businesses with a quote/contact form.
@@ -505,7 +506,7 @@ With an active set, the panel offers one tab per agent plus an "Ask all" tab. An
 
 ## 9. Data store (Postgres)
 
-- `businesses(business_id PK, host, phone_norm, address_norm, place_id, doc JSONB, core_version, profile_ref, verification_status, publication_status, geo, created_at, updated_at, last_verified_at)`
+- `businesses(business_id PK, host, phone_norm, address_norm, place_id (derived from `system.source_ids`), doc JSONB, core_version, profile_ref, verification_status, publication_status, geo, created_at, updated_at, last_verified_at)`
 - `business_embeddings(business_id, view, embedding vector, doc_version)`
 - `service_areas(business_id, kind, value)` for city/ZIP matching
 - `source_evidence(id, job_id, business_id (null until allocated), field_path, value, source, method, confidence, retrieved_at, ladder_step, origin)`
@@ -534,7 +535,7 @@ Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and
 
 `publication_status`: `draft` → `published` (or `suppressed`).
 
-- Business sites that allow indexing and have no opt-out signal MAY be set to `published` automatically, with an "unverified listing" label.
+- Business sites that allow indexing and have no opt-out signal MAY be set to `published` automatically, with an "unverified listing" label. A listing-only business (section 5) has no site to check for opt-out signals, so it is created as `draft` and is never auto-published; an admin publishes it in v1.
 - Sites with noindex/nofollow, a robots.txt disallow, or an explicit opt-out are `suppressed` (reason `opt_out`): not searchable or chattable, and the host is added to the suppression list. In v1 there is no opt-in path; owner opt-in comes with the claim flow (section 10).
 - Honor takedown requests: `POST /v1/takedown` (admin in v1) deletes the record, embeddings, raw pages, chat history, pre-migration backups, and every row keyed by that host's `job_id`s (including jobs that never allocated a `business_id`), and adds the host to the suppression list (and the `place_id`, when known) so it is not re-ingested. A takedown of a listing-only business, which has no host, adds its `place_id` and `phone_norm`. `phone_norm` is never added for a business with a site, since a shared or central number would block other locations.
 - Before any ingest step, including the fallback ladder, check the suppression list and the host's opt-out signals (section 5.1).
