@@ -128,14 +128,22 @@ Anything useful that no profile field fits goes here, so nothing is lost:
 
 ```json
 "knowledge": {
-  "facts":     [{ "key": "reentry_policy", "label": "Re-treatment guarantee", "value": "...", "source_url": "...", "confidence": 0.95, "retrieved_at": "..." }],
-  "faqs":      [{ "q": "...", "a": "...", "source_url": "..." }],
-  "documents": [{ "title": "Menu PDF", "url": "...", "text": "..." }],
-  "social_proof": [{ "kind": "testimonial", "origin": "self_published", "text": "...", "attribution": "..." }]
+  "facts":     [{ "id": "reentry_policy", "key": "reentry_policy", "label": "Re-treatment guarantee", "value": "...", "time_sensitive": false, "source_url": "...", "method": "...", "confidence": 0.95, "retrieved_at": "...", "origin": "business" }],
+  "faqs":      [{ "id": "faq_1", "q": "...", "a": "...", "source_url": "...", "method": "...", "confidence": 0.9, "retrieved_at": "...", "origin": "business" }],
+  "documents": [{ "id": "doc_menu", "title": "Menu PDF", "url": "...", "excerpt": "...", "snapshot_ref": "...", "method": "...", "retrieved_at": "...", "origin": "business" }],
+  "social_proof": [{ "id": "sp_1", "kind": "testimonial", "text": "...", "attribution": "...", "source_url": "...", "retrieved_at": "...", "origin": "self_published" }]
 }
 ```
 
-- `social_proof` entries MUST carry `origin` (`self_published` or `third_party`). The agent and UI MUST NOT present self-published testimonials as verified reviews.
+- **Provenance on every entry.** Each fact, FAQ, document, and social-proof entry carries `source_url`, `retrieved_at`, and `origin` (`business`, `third_party`, or `llm_inferred`), plus `method`, `confidence`, and `ladder_step` (section 5.1) where they apply. This is the same provenance rule as core.
+- **Stable IDs.** Every entry has an `id`, unique within its list, that survives edits and re-extraction. Citations use `knowledge.<list>[<id>]` (for example `knowledge.facts[reentry_policy]`), and these paths serve as `evidence_path` in match state (section 7.4). Array indices are never used as paths.
+- **Only what a source states.** A fact records only what a source says. There is no "does not offer X" fact unless a source states it (section 4.1: null means unknown). FAQ answers come from source text and are never written by the model. A model-generated FAQ is marked `llm_inferred` and is never presented as the business's own words.
+- **Restricted categories.** Prices, offers, and guarantees MUST NOT be stored in `knowledge` from third-party or search-derived evidence. This mirrors the profile `source_restrictions` (section 4.2) and the `allowed_offers` rule (section 6.3), so knowledge cannot be used to get around them.
+- **Brand claims** go to `parent_brand` (section 4.4), not to `facts`.
+- **Freshness.** `time_sensitive` (optional boolean, or a `max_age`) on a fact gets the same hedging in chat and refresh in ingest as the profile `freshness` entries.
+- **Keys.** `key` is snake_case, so repeated keys can be matched for promotion.
+- **Documents.** The full text lives in the raw snapshot (section 6.2) referenced by `snapshot_ref`. The JSON holds only a short `excerpt`, so the Postgres doc stays small. In v1, documents are not embedded; only their excerpts are indexed by keyword (section 7.1).
+- `social_proof` entries MUST carry `origin` (`self_published` or `third_party`). The agent and UI MUST NOT present self-published testimonials as verified reviews. Store `attribution` only as the business published it, and never add names the extractor inferred.
 - The extractor promotes repeated `facts` keys across businesses into candidate profile fields (log them; a human decides).
 
 ### 4.4 Entity identity and franchises
@@ -255,7 +263,7 @@ Emulate: natural-language, meaning-based queries; ranked results with content-ri
 
 ### 7.1 Index (derived generically from the JSON)
 
-- Dense embeddings of several views, rendered from the JSON by templates: (a) core identity/categories/tagline/attributes, (b) the profile's `embed_template` output, (c) knowledge facts + FAQs. One vector per view.
+- Dense embeddings of several views, rendered from the JSON by templates: (a) core identity/categories/tagline/attributes, (b) the profile's `embed_template` output, (c) knowledge facts + FAQs (documents are not embedded in v1; their excerpts are keyword-indexed only). One vector per view.
 - Keyword index: `tsvector` over the rendered text plus `pg_trgm` for names.
 - Facets: core facets (categories, price tier, attributes, verification) + each profile's declared facets. The search code reads facet definitions from the manifest and contains no vertical-specific logic. A null facet value is indexed as unknown, never as false.
 - **Location index**: two mechanisms, chosen per business:
@@ -454,7 +462,7 @@ Deferred. In v1 all edits are made by an admin through the `PATCH` endpoint, and
 
 ## 12. Testing and evaluation
 
-- **Schema fixtures**: every profile ships with 3+ example JSON fixtures (including a sparse one with mostly nulls and tri-state booleans left null). CI validates them against core + profile and runs migrations on old fixtures. CI also validates each manifest: `description` is present and within the length limit, every facet `path` exists in the profile schema with a matching `type`, and every `freshness` and `source_restrictions` path exists. Fixtures include a stale time-sensitive field and a restricted field filled only by third-party evidence, and the checks must flag and reject them respectively.
+- **Schema fixtures**: every profile ships with 3+ example JSON fixtures (including a sparse one with mostly nulls and tri-state booleans left null). CI validates them against core + profile and runs migrations on old fixtures. CI also validates each manifest: `description` is present and within the length limit, every facet `path` exists in the profile schema with a matching `type`, and every `freshness` and `source_restrictions` path exists. Fixtures include a stale time-sensitive field and a restricted field filled only by third-party evidence, and the checks must flag and reject them respectively. Knowledge fixtures include an entry with full provenance, an FAQ marked `llm_inferred`, and a third-party price in `knowledge.facts` that validation must reject. CI also checks that entry `id`s are unique within each list and that every knowledge entry has `source_url`, `retrieved_at`, and `origin`.
 - **Extraction evals**: a golden set of 30+ real sites across at least 4 verticals (include a restaurant, a service-area business, a franchise subdomain, and a thin one-page site), with hand-labeled JSON. Report per-field precision/recall and profile-classification accuracy. Verify absent data stays null and is never `false`. Gate merges on no regression.
 - **Fallback-ladder evals**: simulated blocked sites (bot protection, JS wall, rate limit). Verify the ladder order, the stop-at-sufficient-confidence rule, `ladder_step` and `origin: third_party` on search evidence, and that search-derived values are never accepted for offers, guarantees, or prices. Verify hosts with an opt-out signal or on the suppression list make zero search-provider calls. Verify the pipeline sends no spoofed headers, and that every ladder call, whichever provider, avoids live-fetching the target (for Exa, cache-only with no live crawl parameters).
 - **Durable-execution evals** (Temporal, section 6.5):
