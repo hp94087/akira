@@ -65,6 +65,7 @@ Hand this file to a coding agent. Build in the phases in section 15. Ask before 
 | Schemas | JSON Schema files in `/schemas`, loaded at startup, validated with `jsonschema`. `embed_template` (section 4.2) uses sandboxed Jinja2 |
 | Config | YAML and JSON files in `/config` (adapters, ladder, aggregator denylist), validated with Pydantic at startup |
 | Embeddings / LLM | Provider-agnostic interfaces; default Claude for extraction and chat; a small, cheap model for query understanding and routing |
+| Geocoding | Provider-agnostic interface behind a `geocoder` adapter with a `license` block (section 5). The provider is chosen at build time after reviewing its terms on storing coordinates |
 | Search API (ingest fallback) | Provider-agnostic interface; default Exa Search API, Tavily as an alternative (section 5.1) |
 | Frontend | Next.js (App Router) + TypeScript + Tailwind, SSE streaming chat |
 | Infra | Docker Compose for dev (app, Postgres, Redis, MinIO, Temporal server + UI, a separate Postgres database for Temporal, workers); env-based config; structured JSON logs; OpenTelemetry traces |
@@ -85,7 +86,7 @@ Fields every business has. Search, cards, and the chat shell depend only on thes
 - `policies` (nullable): `returns`, `delivery_shipping`, `cancellation_refund`, `warranty_guarantee`, each `{ summary, url }` and each nullable. Provenance is tracked per path, for example `policies.returns.summary`
 - `capabilities_and_actions`: `supported_intents[]`, `external_links{}` (the only store for links the agent may share, for example `contact_form`, `offers`, `order`)
 - `agent_guardrails`: `allowed_offers[]` (objects: `text`, `terms_url`, `expires_at`), `prohibited_actions[]`, `fallback_message`
-- `system`: `verification_status` (`unverified` | `verified`), `publication_status` (`draft` | `published` | `suppressed`; section 11), `access_status` (`open` | `technical_block` | `explicit_opt_out`; recorded by ingest, never edited by hand; `explicit_opt_out` leads to `suppressed`, `technical_block` does not), `source_ids` (nullable: `places_place_id`), `last_verified_at`, `field_provenance{}` (keyed by core and profile field path; see Provenance below), `warnings[]` (see 5.1)
+- `system`: `verification_status` (`unverified` | `verified`), `publication_status` (`draft` | `published` | `suppressed`; section 11), `access_status` (`open` | `technical_block` | `explicit_opt_out`; recorded by ingest, never edited by hand; `explicit_opt_out` leads to `suppressed`, `technical_block` does not), `source_ids` (nullable: `places_place_id`), `last_verified_at`, `field_provenance{}` (keyed by core and profile field path; see Provenance below), `warnings[]` (shape and codes below)
 
 Every field except `schema_version`, `business_id`, and `identity.dba_name` MUST be nullable. Absence is normal and the pipeline must handle it.
 
@@ -94,7 +95,25 @@ Every field except `schema_version`, `business_id`, and `identity.dba_name` MUST
 - **Null means unknown, not "no".** Booleans are tri-state: `true`, `false`, or `null`. The extractor emits `false` only when a source states it (for example "we do not offer weekend service"), never because the data is silent. Search, chat, and match state (section 7.4) all treat `null` as unknown.
 - **Provenance.** Each `field_provenance` entry, keyed by field path, carries `source_url`, `method`, `confidence`, `retrieved_at`, `ladder_step` (section 5.1), and `origin` (`business`, `third_party`, or `llm_inferred`). It covers core and profile paths. Knowledge entries carry the same fields inline (section 4.3).
 - **Restricted paths.** `operations.price_tier`, `policies.*`, and `agent_guardrails.allowed_offers` MUST NOT be filled from third-party or search-derived evidence (the same rule as profile `source_restrictions` and knowledge, sections 4.2 and 4.3). `allowed_offers` comes only from the business's own site or an admin edit (section 6.3).
-- **Hours.** `hours_structured` is the source of truth. `hours` (display strings) is generated from it; it holds source text only when the hours could not be parsed, and is then flagged in `warnings[]`.
+- **Warnings.** Each `warnings[]` entry is `{ code, message, field_path (nullable), created_at }`. `code` is an enum in `core@1.0.json`, so warnings can be counted, tested, and acted on. Codes defined in this spec:
+
+  | Code | Raised when |
+  |---|---|
+  | `opt_out` | An opt-out signal (noindex/nofollow, site-wide disallow, explicit opt-out) suppressed the record (5.1, 6.2) |
+  | `technical_block` | A technical block sent ingest down the ladder (5.1) |
+  | `adapter_unavailable` | An adapter errored or was unavailable and its step was skipped (5) |
+  | `step_skipped` | A ladder step did not run for another reason (5.1) |
+  | `source_conflict` | Sources disagreed and merge picked one (5) |
+  | `identity_conflict` | Sources disagreed on `contact.phone` or `location.address` (5) |
+  | `identity_ambiguous` | Two possible matches, or no key to resolve identity (4.4, 5) |
+  | `listing_only` | The record was built without a website (5) |
+  | `low_confidence` | A value below the confidence threshold was kept above the floor (5.1) |
+  | `ladder_budget_exhausted` | The per-job search-call cap was reached (5.1) |
+  | `entity_unverifiable` | Step 4 was skipped because there was nothing to verify against (5.1) |
+  | `value_expired` | A stored value passed its license `cache_ttl` and was nulled (5) |
+  | `hours_unparsed` | Hours could not be parsed and `hours` holds source text (4.1) |
+  | `prompt_injection` | Instruction-like text was found in crawled content (6.3) |
+- **Hours.** `hours_structured` is the source of truth. `hours` (display strings) is generated from it; it holds source text only when the hours could not be parsed, and is then flagged with `hours_unparsed`.
 - **Derived, not stored.** The data sources behind a record (for the "built from public listings" notice) and the ladder steps used are computed from `field_provenance` at read time. Parking, access, and similar details live in `knowledge.facts` (for example key `parking_and_access`).
 - **Shapes** (the exact JSON Schema lives in `core@1.0.json`; this is the intent). All members are nullable.
   - `address`: `{ street, unit, locality, region, postal_code, country }`, with `country` as ISO 3166-1 alpha-2. `address_norm` (section 4.4) is derived from it in 6.4.
@@ -136,7 +155,7 @@ Anything useful that no profile field fits goes here, so nothing is lost:
 
 ```json
 "knowledge": {
-  "facts":     [{ "id": "reentry_policy", "key": "reentry_policy", "label": "Re-treatment guarantee", "value": "...", "time_sensitive": false, "source_url": "...", "method": "...", "confidence": 0.95, "retrieved_at": "...", "origin": "business" }],
+  "facts":     [{ "id": "reentry_policy", "key": "reentry_policy", "label": "Re-treatment guarantee", "category": "guarantee", "value": "...", "time_sensitive": false, "source_url": "...", "method": "...", "confidence": 0.95, "retrieved_at": "...", "origin": "business" }],
   "faqs":      [{ "id": "faq_1", "q": "...", "a": "...", "source_url": "...", "method": "...", "confidence": 0.9, "retrieved_at": "...", "origin": "business" }],
   "documents": [{ "id": "doc_menu", "title": "Menu PDF", "url": "...", "excerpt": "...", "snapshot_ref": "...", "method": "...", "retrieved_at": "...", "origin": "business" }],
   "social_proof": [{ "id": "sp_1", "kind": "testimonial", "text": "...", "attribution": "...", "source_url": "...", "retrieved_at": "...", "origin": "business" }]
@@ -146,7 +165,7 @@ Anything useful that no profile field fits goes here, so nothing is lost:
 - **Provenance on every entry.** Each fact, FAQ, document, and social-proof entry carries `source_url`, `retrieved_at`, and `origin` (`business`, `third_party`, or `llm_inferred`), plus `method`, `confidence`, and `ladder_step` (section 5.1) where they apply. This is the same provenance rule as core.
 - **Stable IDs.** Every entry has an `id`, unique within its list, that survives edits and re-extraction. Citations use `knowledge.<list>[<id>]` (for example `knowledge.facts[reentry_policy]`), and these paths serve as `evidence_path` in match state (section 7.4). Array indices are never used as paths.
 - **Only what a source states.** A fact records only what a source says. There is no "does not offer X" fact unless a source states it (section 4.1: null means unknown). FAQ answers come from source text and are never written by the model. A model-generated FAQ is marked `llm_inferred` and is never presented as the business's own words.
-- **Restricted categories.** Prices, offers, and guarantees MUST NOT be stored in `knowledge` from third-party or search-derived evidence. This mirrors the profile `source_restrictions` (section 4.2) and the `allowed_offers` rule (section 6.3), so knowledge cannot be used to get around them.
+- **Restricted categories.** Each fact has an optional `category` set by the extractor: `price` | `offer` | `guarantee` | `other`. Facts with category `price`, `offer`, or `guarantee` MUST NOT be stored from third-party or search-derived evidence (any `origin` other than `business`). Validation enforces this, and it also rejects a third-party fact whose `value` matches a currency or percent-off pattern, whatever its `category`, so a mislabeled `other` cannot slip through. This mirrors the profile `source_restrictions` (section 4.2) and the `allowed_offers` rule (section 6.3), so knowledge cannot be used to get around them.
 - **Brand claims** go to `parent_brand` (section 4.4), not to `facts`.
 - **Freshness.** `time_sensitive` (optional boolean, or a `max_age`) on a fact gets the same hedging in chat and refresh in ingest as the profile `freshness` entries.
 - **Keys.** `key` is snake_case, so repeated keys can be matched for promotion.
@@ -227,7 +246,7 @@ Ingestion is a set of adapters writing into the same pipeline. A merge step reco
 - `fetch(target) -> evidence[]`.
 - `license`: `{ terms_url, storable_fields, cache_ttl, attribution, reviewed_on }`.
 
-A write guard in the pipeline enforces `license`: it drops evidence for any field not in `storable_fields`, and a stored value past `cache_ttl` is set to `null`, flagged in `system.warnings[]`, and queued for refresh. Defaults follow the most restrictive reading. For `places_api` only `place_id` is storable until a human reviews the current terms and records `reviewed_on` and the allowed fields in the config. Until then Places data is used only transiently (for discovery and entity checks) and is not persisted, so step 2 through `places_api` is inactive.
+A write guard in the pipeline enforces `license`: it drops evidence for any field not in `storable_fields`, and a stored value past `cache_ttl` is set to `null`, flagged with a `value_expired` warning, and queued for refresh. Defaults follow the most restrictive reading. For `places_api` only `place_id` is storable until a human reviews the current terms and records `reviewed_on` and the allowed fields in the config. Until then Places data is used only transiently (for discovery and entity checks) and is not persisted, so step 2 through `places_api` is inactive.
 
 | Adapter | Use | Notes |
 |---|---|---|
@@ -235,20 +254,21 @@ A write guard in the pipeline enforces `license`: it drops evidence for any fiel
 | `places_api` | Official Google Places API for discovery and basics (name, address, phone, hours) | MUST use the official API. Honor the `license` config: caching limits and attribution requirements |
 | `owner` | Owner claims a listing, pastes URL, edits JSON | Post-v1 (section 10). In v1, admin edits play this role; highest trust, overrides crawled data |
 | `open_data` | OpenStreetMap, business registries, other APIs with compatible terms | Record license per source |
+| `geocoder` | Address to coordinates for `location.geo` (section 6.4) | Not a ladder step: it runs during normalization. Same `license` block and write guard as other adapters |
 | `search_api` | Exa Search API (default) or Tavily, in `site` mode (domain-restricted) or `broad` mode | Fallback only (section 5.1). Lower trust; provider terms apply |
 
-An adapter that errors or is unavailable adds a `system.warnings[]` entry and its step is skipped. It never blocks the ingest (retries follow section 6.5).
+An adapter that errors or is unavailable adds an `adapter_unavailable` warning and its step is skipped. It never blocks the ingest (retries follow section 6.5).
 
-- MUST NOT scrape Google Search, Maps, or Local Services result pages, or any site whose terms or robots.txt disallow automated access.
+- MUST NOT scrape Google Search, Maps, or Local Services result pages, or any site whose terms or site-wide robots.txt disallow automated access.
 - **Aggregator and results pages.** `POST /v1/ingest` rejects a submitted URL with `422 { "error": "aggregator_url", "message", "suggestions" }` when its host is on the denylist in `/config/aggregators.json`, or when the page shows several businesses (more than 3 distinct `LocalBusiness` JSON-LD entities, or more than 5 distinct phone numbers; both thresholds configurable). An admin can override the page-signal check with `options.skip_aggregator_check`. The suggestions are discovery via `places_api` or submitting each business's own website.
 - **Discovery.** `POST /v1/discover { "query": "pest control", "location": "Sunnyvale, CA", "radius_km": 25, "max_candidates": 20 }` (defaults shown; `max_candidates` is capped at 50) starts a parent workflow (ID `discover-{hash(query, location, radius_km)}`, which rejects a concurrent duplicate) and returns `202 { "discovery_id", "candidate_count" }`, where `candidate_count` is `null` until the Places search finishes (the status endpoint reports it). The workflow pages through Places results until `max_candidates` is reached. `GET /v1/discover/{discovery_id}` returns each candidate as `{ name, place_ref, status, job_id, business_id }`, where `status` is `queued`, `ingesting`, `done`, `failed`, `listing_only`, `skipped_existing`, `skipped_suppressed`, or `skipped_no_source`.
   - **Pre-checks, before any child workflow or crawl.** A candidate that matches an existing record by the keys of section 4.4 (`place_id`; host + normalized phone; or normalized phone + normalized name) is `skipped_existing` (unless `force_refresh`). A host alone is not a match, so sibling locations on one host are all ingested. One that matches the suppression list (by host, `place_id`, or `phone_norm`; section 11) is `skipped_suppressed`. Each candidate's website goes through the aggregator check above; if it fails (for example a Facebook or Yelp page), the candidate is treated as having no website and becomes listing-only.
   - **Cost bounds.** `max_candidates`, at most 5 child ingests running at once (configurable), a per-discovery cap on search-provider calls (default 100, in `/config/ladder.yaml`), and the per-host rate limits in section 6.5.
   - **Terms.** Only fields allowed by the `places_api` `license` are stored. If the allowed fields are not enough to build a record (no storable name or phone), a candidate without a website is `skipped_no_source`.
-- **Listing-only businesses** (a candidate with no website). The record is built from `places_api` evidence (step 2) and broad search (step 4); step 1 and step 3 need a site. It has `contact.website = null`, a `system.warnings[]` entry `listing_only`, and the "built from public listings" label. With no site there are no opt-out signals to check, so it is created as `draft` and an admin must publish it in v1. It is identified by `system.source_ids.places_place_id`, then `phone_norm` + normalized name (section 4.4), and its takedowns are recorded by `place_id` and `phone_norm` (section 11).
-- **Merge priority**: admin/owner (admin only in v1) > structured data on the business's own site (JSON-LD) > site text > `places_api` > `open_data` > `search_api` (site mode) > `search_api` (broad mode) > LLM inference. Every conflict is recorded in `system.warnings`.
+- **Listing-only businesses** (a candidate with no website). The record is built from `places_api` evidence (step 2) and broad search (step 4); step 1 and step 3 need a site. It has `contact.website = null`, a `listing_only` warning, and the "built from public listings" label. With no site there are no opt-out signals to check, so it is created as `draft` and an admin must publish it in v1. It is identified by `system.source_ids.places_place_id`, then `phone_norm` + normalized name (section 4.4), and its takedowns are recorded by `place_id` and `phone_norm` (section 11).
+- **Merge priority**: admin/owner (admin only in v1) > structured data on the business's own site (JSON-LD) > site text > `places_api` > `open_data` > `search_api` (site mode) > `search_api` (broad mode) > LLM inference. Every conflict is recorded as a `source_conflict` warning.
   - **Freshness.** When a new run is merged into an existing record, for time-sensitive fields (section 4.1, and `freshness` in manifests), if the existing higher-ranked value is stale (past `max_age`) and a newly fetched lower-ranked value from step 2 is fresh, the fresher value wins and the conflict is recorded. Admin edits are exempt and always win (section 4.5). Search-derived values never win on freshness.
-  - **Identity keys.** If sources disagree on `contact.phone` or `location.address` (the keys in section 4.4), both values are recorded, the higher-priority one is kept, and a `identity_conflict` warning is added. If the conflict leaves two possible matches in identity resolution, the record is flagged `identity_ambiguous`.
+  - **Identity keys.** If sources disagree on `contact.phone` or `location.address` (the keys in section 4.4), both values are recorded, the higher-priority one is kept, and an `identity_conflict` warning is added. If the conflict leaves two possible matches in identity resolution, the record is flagged `identity_ambiguous`.
 - **Attribution.** The "built from public listings" notice includes the `license.attribution` text of every adapter that appears in the record's `field_provenance` (for example the OpenStreetMap credit, and the Places attribution where its terms require one).
 
 ### 5.1 Fallback ladder
@@ -264,9 +284,9 @@ For each wanted field (see Scope and cost below) that the pipeline still needs a
 
 **Compliance**
 
-- **Opt-outs are checked before any step runs.** These signals skip the whole ladder, including steps 3 and 4 (section 11): a robots.txt disallow that covers the whole site for our user agent (the token in `/config/adapters.yaml`) or `*` (for example `Disallow: /`), noindex/nofollow, an explicit opt-out, or an entry on the suppression list. A listing-only candidate is checked against the suppression list by `place_id` and `phone_norm`.
+- **Opt-outs are checked before any step runs.** These signals skip the whole ladder, including steps 3 and 4 (section 11; `robots.txt` and the suppression list are checked before the first fetch, and noindex/nofollow is seen on the first page fetch, sections 6.2 and 6.5): a robots.txt disallow that covers the whole site for our user agent (the token in `/config/adapters.yaml`) or `*` (for example `Disallow: /`), noindex/nofollow, an explicit opt-out, or an entry on the suppression list. A listing-only candidate is checked against the suppression list by `place_id` and `phone_norm`.
 - **A path-specific robots.txt disallow is not an opt-out.** For example `Disallow: /wp-admin/` only keeps those paths out of the crawl. Any step 3 or 4 result whose URL falls under a path disallowed for our user agent is discarded.
-- **Technical blocks are not opt-outs.** A technical block is any of the following after retries (a 429 is retried honoring `Retry-After`, up to 3 attempts per page by default): a bot-protection challenge page, an HTTP 403 or 503, a JS wall that Playwright cannot resolve, or timeouts. It sets `system.access_status = technical_block` and sends ingest down the ladder. A plain 403 is not an opt-out. Steps 3 and 4 use only the provider's licensed API output and never contact the blocked site. The pipeline never evades a block on the site itself: no user-agent spoofing, proxy rotation, CAPTCHA solving, or cached and archived copies.
+- **Technical blocks are not opt-outs.** A technical block is any of the following after retries (a 429 is retried honoring `Retry-After`, up to 3 attempts per page by default): a bot-protection challenge page, an HTTP 403 or 503, a JS wall that Playwright cannot resolve, or timeouts. It sets `system.access_status = technical_block`, adds a `technical_block` warning, and sends ingest down the ladder. A plain 403 is not an opt-out. Steps 3 and 4 use only the provider's licensed API output and never contact the blocked site. The pipeline never evades a block on the site itself: no user-agent spoofing, proxy rotation, CAPTCHA solving, or cached and archived copies.
 - **Exa request shape** (checked against Exa's documentation on 2026-11-20; re-verify at build time). Both modes request `contents: { "highlights": true }` and MUST be served from Exa's cache only, in one of two valid forms:
   - the default `type` with `contents.maxAgeHours: -1`; or
   - `type: "lite"` with no freshness parameter. `lite` never fetches live. It rejects `maxAgeHours` (even `-1`), `livecrawl`, and `livecrawlTimeout` with a 400, so they MUST NOT be sent on a `lite` request. Results with no cached copy are omitted, and the field stays unfilled.
@@ -285,7 +305,7 @@ For each wanted field (see Scope and cost below) that the pipeline still needs a
 **Evidence handling**
 
 - **Search evidence is lower trust.** It records `ladder_step`, the source URL, and `method` (`search_site_highlight` or `search_broad_highlight`); it is marked `origin: third_party` when it is not the business's own words; and it ranks below steps 1 and 2 in merge. The merger MUST reject search-derived values for every restricted path: the core paths in section 4.1 (including `allowed_offers`, `policies.*`, and `price_tier`), each manifest's `source_restrictions` (section 4.2), and the restricted categories in `knowledge` (section 4.3).
-- **Confidence comes from the method.** `confidence_by_method` in `/config/ladder.yaml` assigns it. Starting defaults (tune with the evals): `html_tel_link` 0.98, `json_ld` 0.95, `places_api` 0.9, `site_text` 0.8, `open_data` 0.8, `search_site_highlight` 0.75, `search_broad_highlight` 0.6, `llm_inference` 0.5. A cap on search-derived confidence (default 0.8) is a safety limit that applies if these numbers are raised; the defaults are below it.
+- **Confidence comes from the method.** `confidence_by_method` in `/config/ladder.yaml` assigns it. Starting defaults (tune with the evals): `html_tel_link` 0.98, `json_ld` 0.95, `places_api` 0.9, `site_text` 0.8, `open_data` 0.8, `search_site_highlight` 0.75, `search_broad_highlight` 0.6, `geocode` 0.9, `llm_inference` 0.5. A cap on search-derived confidence (default 0.8) is a safety limit that applies if these numbers are raised; the defaults are below it.
 - **Entity verification for search results.** Search values are accepted only if their source is about the target business.
   - *Step 3* is scoped to the target's domain, so a result is accepted by default. On a host with sibling locations (more than one record on the host, or a locations page), the result must also match the target's locality or phone.
   - *Step 4* is not scoped, so a result must match the normalized name (fuzzy, above a configured threshold) and either the locality or the phone.
@@ -304,7 +324,7 @@ For each wanted field (see Scope and cost below) that the pipeline still needs a
 **Recording**
 
 - **Audit.** Every search-provider call writes a `search_api_calls` row (section 9): provider, mode, query, and for each result its URL and outcome (`accepted`, `entity_mismatch`, `disallowed_path`, or `no_result`).
-- **Document.** `system.access_status` (`open`, `technical_block`, or `explicit_opt_out`) and a `system.warnings[]` entry for each block, skipped step, or `low_confidence` fill. Which steps filled which fields is in `field_provenance.ladder_step`; there is no separate list.
+- **Document.** `system.access_status` (`open`, `technical_block`, or `explicit_opt_out`) and a warning for each block (`technical_block`), skipped step (`step_skipped` or `adapter_unavailable`), or `low_confidence` fill. Which steps filled which fields is in `field_provenance.ladder_step`; there is no separate list.
 - Log, per job, which step filled each field. These counts feed the fallback-ladder evals (section 12).
 
 ## 6. Ingestion pipeline
@@ -337,11 +357,11 @@ For each wanted field (see Scope and cost below) that the pipeline still needs a
 - `supported_intents` is computed from evidence, not assumed. Examples: `check_hours` only if hours exist; `share_order_link` only if an ordering link exists; `capture_estimate_lead` for service businesses with a quote/contact form.
 - `allowed_offers` MUST come only from the site or an admin/owner edit and carry `terms_url` and `expires_at` when known. If terms are not stated, set `terms_url` to the offers page and leave eligibility unstated.
 - Validate; on failure retry once with the validation errors. Still failing → job `failed` with details.
-- **Prompt-injection hygiene**: strip or flag instruction-like text in crawled content (e.g. "ignore previous instructions") and record a warning.
+- **Prompt-injection hygiene**: strip or flag instruction-like text in crawled content (e.g. "ignore previous instructions") and record a `prompt_injection` warning.
 
 ### 6.4 Normalization
 
-- Phone to E.164. Geocode addresses when present. For service-area businesses, normalize `service_area` to cities and postal codes where the site or source states them; do not guess ZIP lists.
+- Phone to E.164. Geocode addresses when present, through the `geocoder` adapter (section 5); results are stored only as its `license` allows, with `method: geocode` and `origin: third_party`. For service-area businesses, normalize `service_area` to cities and postal codes where the site or source states them; do not guess ZIP lists.
 - Hours to `hours_structured` in the business's timezone when hours exist.
 - **Freshness policy**: each time-sensitive field has a max age (defaults: hours 30 days, offers 14 days, prices 14 days; configurable). Profile fields use the `freshness.max_age` in their manifest (section 4.2). Past the max age the field is *stale*: the agent hedges it ("as of {date}, please confirm by phone"), ranking penalizes it, and the refresh scheduler prioritizes it.
 - Categories mapped to a controlled taxonomy with aliases (`/schemas/taxonomy/categories.json`) and stored as taxonomy IDs; the first is the primary category. Original labels stay in `source_evidence`.
@@ -685,7 +705,7 @@ README.md
     "prohibited_actions": ["Do not quote prices; direct to free estimate", "Do not guarantee elimination of a pest or timeline", "Do not give medical advice"],
     "fallback_message": "I don't have that detail, but our team can help. Share your name and best phone number, or call 408-638-2951."
   },
-  "system": { "verification_status": "unverified", "publication_status": "suppressed", "access_status": "explicit_opt_out", "last_verified_at": "2026-11-20T02:11:00Z", "field_provenance": { "contact.phone": { "source_url": ".../contact-us/", "method": "html_tel_link", "confidence": 0.98, "retrieved_at": "2026-11-20T02:11:00Z", "ladder_step": 1, "origin": "business" } }, "warnings": ["Page declares noindex,nofollow; suppressed (opt_out)"] }
+  "system": { "verification_status": "unverified", "publication_status": "suppressed", "access_status": "explicit_opt_out", "last_verified_at": "2026-11-20T02:11:00Z", "field_provenance": { "contact.phone": { "source_url": ".../contact-us/", "method": "html_tel_link", "confidence": 0.98, "retrieved_at": "2026-11-20T02:11:00Z", "ladder_step": 1, "origin": "business" } }, "warnings": [{ "code": "opt_out", "message": "Page declares noindex,nofollow; suppressed", "field_path": null, "created_at": "2026-11-20T02:11:00Z" }] }
 }
 ```
 
