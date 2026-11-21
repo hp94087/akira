@@ -23,7 +23,7 @@ flowchart LR
     BQ[Browser task queue<br/>Playwright crawl]
   end
 
-  subgraph STORES[Data stores [9]]
+  subgraph STORES["Data stores [9]"]
     PG[(PostgreSQL 16<br/>businesses JSONB, pgvector, pg_trgm<br/>evidence, audit, sessions, leads)]
     TPG[(Temporal Postgres<br/>separate DB)]
     R[(Redis<br/>caches, rate limits)]
