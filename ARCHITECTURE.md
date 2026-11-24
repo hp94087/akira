@@ -8,18 +8,18 @@ Derived from `SPEC.md`. Section numbers in brackets point back to the spec. The 
 flowchart LR
   subgraph Clients
     U[Public user<br/>search + chat UI<br/>Next.js, SSE]
-    A[Admin<br/>ingest, discover, edit, takedown]
+    A[Admin<br/>ingest, discover, edit, takedown<br/>record opt-out, re-check suppressed host]
   end
 
   subgraph API["FastAPI (request path) [3, 6.1, 7, 8]"]
     S[Search<br/>POST /v1/search<br/>query understanding, retrieve, evaluate, rerank]
     C[Chat<br/>single-business + fan-out router<br/>capability registry, grounding check]
-    AD[Admin API<br/>ingest, discover, refresh, PATCH, takedown]
+    AD[Admin API<br/>ingest incl. dry_run, discover, refresh, PATCH<br/>takedown, suppression, suppression/recheck]
   end
 
   subgraph TEMPORAL["Temporal workers [6.5]"]
     W1[ingest / discover<br/>refresh / reextract]
-    W2[migrate / takedown<br/>lead delivery]
+    W2[migrate / takedown<br/>lead delivery<br/>suppression-recheck Schedule]
     BQ[Browser task queue<br/>Playwright crawl]
   end
 
@@ -69,7 +69,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-  IN[POST /v1/ingest url<br/>or discovery candidate] --> CHK{First activity:<br/>suppression list<br/>+ robots.txt}
+  IN[POST /v1/ingest url<br/>or discovery candidate] --> CHK{First activity, same on refresh:<br/>suppression list<br/>+ robots.txt}
   CHK -->|host / place_id / phone_norm listed| SUP1[[suppressed<br/>no changes]]
   CHK -->|site-wide disallow| RES
   CHK -->|clear| CR[crawling<br/>llms.txt, sitemap, allowed paths<br/>httpx then Playwright]
@@ -87,10 +87,12 @@ flowchart TD
 
   EN --> RES[resolving<br/>identity keys, allocate business_id<br/>merge into existing record]
   RES --> VAL[validating<br/>schema, provenance, restricted paths<br/>publication decision]
-  VAL -->|opt-out recorded| SUP2[[suppressed<br/>stored, not indexed]]
+  VAL -->|opt-out recorded<br/>opt_out_type, access_status = opted_out| SUP2[[suppressed<br/>stored, not indexed]]
   VAL --> IDX[[indexed<br/>embeddings + facets + keyword]]
   VAL -->|schema failure after retry| FAIL[[failed]]
 ```
+
+Every ingest and refresh job ends with one `outcome`: `open`, `path_disallow_only`, `opt_out`, `suppressed_existing`, `technical_block`, `listing_only`, or `failed` [6.6]. A path-specific robots.txt disallow only excludes those paths and is not an opt-out [6.2]. `access_status` is `open`, `technical_block`, or `opted_out`. The kind of opt-out (`site_wide_disallow`, `noindex`, `explicit_opt_out`) is kept in `suppression_list.opt_out_type` and the `opt_out` warning [4.1, 9].
 
 ## 3. Business JSON: three layers [4]
 
@@ -145,9 +147,39 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-  OPT[Opt-out signals<br/>site-wide disallow, noindex, explicit opt-out<br/>suppression list] -->|skip crawl and ladder| SUPP[publication_status = suppressed]
+  OPT[Opt-out signals<br/>site-wide disallow, noindex, explicit opt-out<br/>suppression list<br/>also checked first on refresh] -->|skip crawl and ladder| SUPP[publication_status = suppressed<br/>access_status = opted_out]
   BLOCK[Technical block<br/>403, 503, challenge, timeout] -->|not an opt-out| LADDER[Ladder steps 3 and 4<br/>provider output only]
   RESTR[Restricted paths<br/>prices, offers, guarantees, policies] -->|reject third-party and search evidence| MERGE[Merge]
   LIC[Adapter license block<br/>storable_fields, cache_ttl] -->|write guard| EVID[(source_evidence)]
+  UA[Self-describing user agent<br/>bot info page with opt-out contact<br/>no spoofing, proxies, CAPTCHA solving, archives] -->|identifies every fetch| CRAWL[Crawl, robots.txt and crawl-delay honored]
   TK[Takedown workflow] -->|delete record, index, snapshots, chats, leads<br/>keep keys only| SUPL[(suppression_list)]
 ```
+
+## 6. Suppression lifecycle [6.5, 11]
+
+```mermaid
+flowchart TD
+  SIG[Signal found<br/>site-wide disallow, noindex on page<br/>explicit opt-out via POST /v1/suppression] --> SUP[suppressed<br/>key in suppression_list with opt_out_type<br/>access_status = opted_out<br/>removed from index and active sets]
+  REF[Refresh finds a new signal<br/>on a published site] --> SUP
+  SUP --> MON[Monthly suppression-recheck<br/>robots.txt only for site-wide disallow<br/>entry page for noindex, only if robots.txt allows]
+  MON -->|signal gone| FLAG[signal_cleared_at set<br/>no key removed, no ingest]
+  FLAG --> ADM[Admin: POST /v1/suppression/recheck]
+  SUP --> ADM
+  ADM -->|explicit_opt_out or takedown| REJ[409<br/>owner claim or admin key removal only]
+  ADM -->|signal still present| KEEP[stays suppressed<br/>last_checked_at updated]
+  ADM -->|signal gone| ING[remove key, start ingest<br/>first activity re-checks signals]
+  ING -->|signal returns| SUP
+  ING --> VAL[validating: recompute publication_status]
+  VAL -->|passes| PUB[published, unverified listing<br/>previously_suppressed warning]
+  VAL -->|does not pass| DRF[draft<br/>previously_suppressed warning]
+```
+
+## 7. Job kinds and metrics [6.5, 6.6]
+
+| `kind` | Fetches? | `outcome` | Notes |
+|---|---|---|---|
+| `ingest` | yes | set | Counts toward launch shares and the coverage sample. `dry_run: true` writes only `ingest_jobs` |
+| `refresh` | yes | set | Same first-activity opt-out check. On a technical block keeps existing values and runs the ladder for stale fields only. `refresh-scan` skips suppressed records |
+| `reextract` | no, reads stored snapshots | `null` | Makes no fetch or search call |
+
+Metrics carry `kind` and vertical as labels and never carry business data. Refreshes get their own transition counters (for example `open` to `opt_out`).
