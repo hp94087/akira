@@ -128,8 +128,8 @@ How each goal and principle is actually achieved, and how it is proven. Read a r
 | Facts have an age | `freshness_defaults`, manifest `freshness`, `data_as_of` in prompts, ranking penalty, refresh scan | §6.4, §6.5, §8.2 |
 | Human edits override | `admin_edit` provenance wins merge; re-extraction and refresh never overwrite it | §5, §4.5, §6.1 |
 | Right business | Conservative identity keys, `identity_ambiguous` flag, entity verification for search results | §4.4, §5.1 |
-| Crawl only what is permitted | Opt-out check as the first activity; robots.txt, meta robots; no evasion of blocks | §5.1, §6.2, §6.5 |
-| Opt-outs before publication | `publication_status` gate; opt-out leads to `suppressed` | §11 |
+| Crawl only what is permitted | Opt-out check as the first activity of every ingest and refresh; robots.txt, meta robots; self-describing user agent with a bot info page; no evasion of blocks | §5.1, §6.2, §6.5 |
+| Opt-outs before publication | `publication_status` gate; opt-out leads to `suppressed` with `access_status = opted_out` and its `opt_out_type` recorded; v1 way back only through an admin re-check once the signal is gone | §11 |
 | Content is data | Prompt-injection hygiene on crawled text, snippets, queries, chat messages | §6.3, §7.2, §8.2, §8.6 |
 | Compute facts in code | Open-now, service-area match, active-set scoping, hard requirements | §7.2, §7.4, §8.3 |
 | Inform, never commit | Prompt rules, `prohibited_actions`, grounding post-check | §8.2, §8.4 |
@@ -147,7 +147,7 @@ Who and what the system talks to.
 ```mermaid
 flowchart TB
   user(["Public user<br/>searches and chats"])
-  admin(["Admin<br/>ingest, discover, edit,<br/>publish, takedown"])
+  admin(["Admin<br/>ingest, discover, edit, publish,<br/>takedown, record opt-out,<br/>re-check suppressed host"])
   owner(["Business owner<br/>post-v1 claim flow §10"])
 
   subgraph PLATFORM["Business Discovery + Chat Platform"]
@@ -165,7 +165,7 @@ flowchart TB
   user -->|"HTTPS, SSE"| core
   admin -->|"authenticated HTTPS"| core
   owner -.->|"post-v1"| core
-  core -->|"polite crawl,<br/>identified user agent"| sites
+  core -->|"polite crawl, self-describing<br/>user agent + bot info page"| sites
   core --> places
   core --> opendata
   core --> geocoder
@@ -196,7 +196,7 @@ flowchart TB
   subgraph APP["FastAPI app: request path, latency-bound"]
     api_search["/v1/search<br/>/v1/search/sessions/{id}/active-set<br/>/v1/businesses/{id}/similar"]
     api_chat["/v1/chat/{business_id} SSE<br/>/v1/chat/sessions/{id} SSE"]
-    api_admin["Admin-authenticated:<br/>/v1/ingest, /v1/discover,<br/>/v1/businesses/{id} refresh and PATCH,<br/>/v1/takedown"]
+    api_admin["Admin-authenticated:<br/>/v1/ingest incl. dry_run, /v1/discover,<br/>/v1/businesses/{id} refresh and PATCH,<br/>/v1/takedown, /v1/suppression,<br/>/v1/suppression/recheck"]
     api_public["/v1/businesses/{id}<br/>public sees published only"]
   end
 
@@ -243,7 +243,7 @@ flowchart TB
 
 **Why this split.** Search and chat are latency-bound and stream over SSE, so they stay in FastAPI (`§6.5`). Everything that crawls, calls slow APIs, retries, or runs on a schedule is a Temporal workflow, so it survives worker crashes and is never run twice at once. Playwright gets its own task queue so heavy rendering cannot starve LLM or API activities.
 
-**Observability (`§3`, `§11`).** Structured JSON logs, OpenTelemetry traces, LLM calls logged with `business_id`, token counts, and latency. No PII in logs.
+**Observability (`§3`, `§6.6`, `§11`).** Structured JSON logs, OpenTelemetry traces, LLM calls logged with `business_id`, token counts, and latency. Ingest outcome and ladder fill-rate metrics are labeled by vertical and job `kind`, never by business. No PII in logs.
 
 ---
 
@@ -419,7 +419,7 @@ Every warning is `{ code, message, field_path, created_at }`, with `code` from a
 
 | Code | Raised by | Effect |
 |---|---|---|
-| `opt_out` | Opt-out check, crawl | Record `suppressed`, ladder never runs |
+| `opt_out` | Opt-out check, crawl, refresh | Record `suppressed`, ladder never runs; message names the `opt_out_type` |
 | `technical_block` | Crawl | Ingest goes down the ladder; not suppressed |
 | `adapter_unavailable` | Any adapter after retries | Step skipped, ingest continues |
 | `step_skipped` | Ladder | Step skipped for another reason |
@@ -433,6 +433,7 @@ Every warning is `{ code, message, field_path, created_at }`, with `code` from a
 | `value_expired` | License write guard | Value past `cache_ttl` nulled and queued for refresh |
 | `hours_unparsed` | Normalization | `hours` holds source text, `hours_structured` null |
 | `prompt_injection` | Extraction | Instruction-like text stripped or flagged |
+| `previously_suppressed` | Validating, after an admin re-check | Record came back from suppression; message names the earlier `opt_out_type` and re-check date |
 
 ---
 
@@ -467,7 +468,7 @@ stateDiagram-v2
   failed --> [*]
 ```
 
-`suppressed` is a terminal status, not a failure. A technical block, an unavailable adapter, or an exhausted search budget is never a failure either: each adds a warning and the pipeline continues.
+`suppressed` is a terminal status, not a failure. A technical block, an unavailable adapter, or an exhausted search budget is never a failure either: each adds a warning and the pipeline continues. A `refresh` job runs the same stages (`§6.5`). A `dry_run` ingest runs the same stages but writes only its `ingest_jobs` row (`§6.1`).
 
 ### 7.2 End-to-end flow
 
@@ -488,7 +489,7 @@ flowchart TD
     crawl["llms.txt + sitemap first<br/>then same-host links by path keywords<br/>services, menu, about, contact, hours, faq, pricing..."]
     crawl --> fetch["httpx first, Playwright fallback<br/>5 MB HTML, 20 MB PDF, 30 s, depth 2, 3 redirects<br/>SSRF checks on every fetch and redirect"]
     fetch --> robots{"Signals on page?"}
-    robots -->|"noindex or nofollow"| noidx["Keep only what this page yields<br/>stop crawl, block ladder and publication"]
+    robots -->|"noindex or nofollow,<br/>within noindex_scope"| noidx["Keep only what this page yields<br/>stop crawl, block ladder and publication"]
     robots -->|"403, 503, challenge,<br/>JS wall, timeouts after retries"| block["access_status = technical_block<br/>technical_block warning"]
     robots -->|"ok"| snap["Store raw HTML + cleaned text<br/>in object storage, keyed by job_id"]
     fetch --> redir{"Redirect to<br/>another host?"}
@@ -513,7 +514,7 @@ flowchart TD
   optrec --> res
   res["resolving: identity keys, allocate or reuse business_id,<br/>merge into existing record, backfill job_id rows<br/>see section 9"]
   res --> val["validating: schema, provenance on every non-null field,<br/>restricted paths, unique knowledge ids,<br/>warning codes, ladder_step range, license<br/>retry once with errors"]
-  val -->|"opt-out"| sup["suppressed: stored, not indexed,<br/>host added to suppression list"]
+  val -->|"opt-out"| sup["suppressed: stored, not indexed,<br/>access_status = opted_out,<br/>host added to suppression list<br/>with opt_out_type"]
   val -->|"listing-only"| draft["draft: indexed, never served<br/>until an admin publishes"]
   val -->|"site allows indexing,<br/>no opt-out signal"| pub["published, may be automatic<br/>with unverified listing label"]
   val -->|"still invalid"| fail["failed with details"]
@@ -529,6 +530,31 @@ Identity is resolved after enrichment (`§6`) because the ladder may find the ph
 flowchart LR
   a["crawl finds<br/>name only"] --> b["ladder step 4 finds<br/>locality: Sunnyvale"] --> c["resolving builds<br/>biz_ecoguard_pest_management_sunnyvale"] --> d["dedupe uses<br/>host + phone or address"]
 ```
+
+### 7.4 Job kinds, outcomes, and coverage
+
+Every `ingest`, `refresh`, and `reextract` workflow writes one `ingest_jobs` row with its `kind` (`§6.5`, `§6.6`, `§9`).
+
+| `kind` | Fetches? | `outcome` | Notes |
+|---|---|---|---|
+| `ingest` | yes | one value | Counts toward launch shares and the coverage sample. `dry_run: true` writes only `ingest_jobs` |
+| `refresh` | yes | one value | Same first-activity opt-out check. A technical block keeps existing values and runs the ladder for stale or missing wanted fields only |
+| `reextract` | no, reads stored snapshots | `null` | No fetch or search call |
+
+```mermaid
+flowchart LR
+  job["Finished ingest or refresh job"] --> o{"outcome"}
+  o --> o1["open"]
+  o --> o2["path_disallow_only<br/>paths skipped, not an opt-out"]
+  o --> o3["opt_out<br/>opt_out_type: site_wide_disallow,<br/>noindex, explicit_opt_out"]
+  o --> o4["suppressed_existing<br/>already on the list"]
+  o --> o5["technical_block"]
+  o --> o6["listing_only"]
+  o --> o7["failed"]
+  o1 & o2 & o3 & o4 & o5 & o6 & o7 --> m["Metrics by vertical and kind<br/>ladder fill rate per step and field<br/>refresh transition counters<br/>no business data"]
+```
+
+**Coverage sample before launch (`§6.6`).** Run at least 300 sites from the target segment with `dry_run: true` and record the share of each `outcome`, opt-outs by type, fill rate per ladder step, and technical-block sites the search provider could not help with. Re-run it whenever the user agent, a provider, or `noindex_scope` changes. Only `kind: ingest` jobs count toward these shares.
 
 ---
 
@@ -599,7 +625,7 @@ flowchart LR
     p1["Path-specific disallow,<br/>for example /wp-admin/"]
   end
 
-  OPT -->|"skip whole ladder,<br/>zero search calls,<br/>access_status = explicit_opt_out"| sup["suppressed record"]
+  OPT -->|"skip whole ladder,<br/>zero search calls,<br/>access_status = opted_out,<br/>opt_out_type recorded"| sup["suppressed record"]
   BLK -->|"access_status = technical_block,<br/>never evade"| lad["steps 3 and 4 using only<br/>the provider's licensed output,<br/>never contacting the site"]
   PATH -->|"do not crawl those paths,<br/>discard search results under them<br/>as disallowed_path"| cont["normal ingest"]
 ```
@@ -818,15 +844,18 @@ flowchart TB
     t6["Schema version bump"]
     t7["POST /v1/takedown"]
     t8["capture_lead in chat"]
+    t9["POST /v1/suppression/recheck"]
+    t10["Schedule suppression-recheck,<br/>monthly, overlap skip"]
   end
   subgraph WFS["Workflows and IDs"]
-    w1["ingest-normalized_url<br/>ingest-place-place_id"]
+    w1["ingest-normalized_url<br/>ingest-place-place_id<br/>ingest-dry-normalized_url"]
     w2["discover-hash"]
     w3["refresh-business_id"]
     w4["reextract-business_id"]
     w5["migrate, singleton"]
     w6["takedown-business_id or key"]
     w7["lead-lead_id"]
+    w8["recheck-host"]
   end
   t1 --> w1
   t2 --> w2 -->|"child per candidate,<br/>max 5 at once"| w1
@@ -836,6 +865,8 @@ flowchart TB
   t6 --> w5
   t7 --> w6
   t8 --> w7
+  t9 --> w8 -->|"signal gone:<br/>remove key, start ingest"| w1
+  t10 -->|"sets signal_cleared_at only,<br/>no key removed, no ingest"| sl[("suppression_list")]
 ```
 
 A duplicate of a running workflow ID is rejected, so a business is never refreshed, re-extracted, or taken down twice at once.
@@ -868,7 +899,7 @@ flowchart LR
   ACTS --> QUEUES
 ```
 
-**Outcome rules.** Non-retryable validation failure ends the job as `failed`. An opt-out ends it as `suppressed`. A technical block, an unavailable adapter, or a failing search provider adds a warning and the ladder moves on. Because histories carry only references, they hold no raw HTML, page text, or contact details, and there is nothing to purge on takedown.
+**Outcome rules.** Non-retryable validation failure ends the job as `failed`. An opt-out ends it as `suppressed`, on ingest or refresh. A technical block, an unavailable adapter, or a failing search provider adds a warning and the ladder moves on. Because histories carry only references, they hold no raw HTML, page text, or contact details, and there is nothing to purge on takedown.
 
 ---
 
@@ -1180,14 +1211,15 @@ stateDiagram-v2
   draft --> published: admin publishes, required for listing-only
   published --> draft: admin unpublishes
   draft --> suppressed: opt-out signal
-  published --> suppressed: opt-out found on refresh
-  suppressed --> suppressed: v1 has no opt-in path
+  published --> suppressed: opt-out found on refresh, or explicit opt-out recorded
+  suppressed --> published: admin re-check, signal gone, passes validation
+  suppressed --> draft: admin re-check, signal gone, does not pass
   published --> [*]: takedown deletes record
   draft --> [*]: takedown deletes record
   suppressed --> [*]: takedown deletes record
 ```
 
-Only `published` records are searchable, chattable, or allowed in an active set. A `suppressed` record keeps the full schema shape but holds only what was obtained before the signal.
+Only `published` records are searchable, chattable, or allowed in an active set. A `suppressed` record keeps the full schema shape but holds only what was obtained before the signal. It leaves suppression in v1 only through the admin re-check (`§16.4`), and only for a site-wide disallow or noindex. An explicit opt-out waits for the post-v1 owner claim, and a takedown deletes the record.
 
 ### 16.2 access_status
 
@@ -1195,13 +1227,13 @@ Only `published` records are searchable, chattable, or allowed in an active set.
 stateDiagram-v2
   [*] --> open
   open --> technical_block: block after retries
-  open --> explicit_opt_out: opt-out signal
-  technical_block --> explicit_opt_out: opt-out signal
+  open --> opted_out: opt-out signal
+  technical_block --> opted_out: opt-out signal
   technical_block --> open: later crawl succeeds
-  explicit_opt_out --> explicit_opt_out: never hand-edited
+  opted_out --> open: admin re-check clears, set by the pipeline
 ```
 
-`access_status` is recorded by ingest only; PATCH cannot change it. `explicit_opt_out` leads to `suppressed`; `technical_block` does not.
+`access_status` is recorded by ingest, refresh, or the `POST /v1/suppression` action only; PATCH cannot change it. `opted_out` covers a site-wide disallow, noindex/nofollow, and an explicit opt-out, and leads to `suppressed`. Which one it was lives only in `suppression_list.opt_out_type` and the `opt_out` warning. `technical_block` does not suppress.
 
 ### 16.3 Takedown
 
@@ -1231,14 +1263,37 @@ sequenceDiagram
 
 `phone_norm` is never suppressed for a business with a site, since a shared or central number would block other locations.
 
-### 16.4 Compliance controls
+### 16.4 Explicit opt-out and re-check (v1)
+
+```mermaid
+flowchart TD
+  own["Owner emails or uses the form<br/>at opt_out_contact on the bot info page"] --> rec["Admin: POST /v1/suppression<br/>host, source"]
+  rec --> sup["suppression_list += host,<br/>opt_out_type: explicit_opt_out<br/>record suppressed, access_status = opted_out,<br/>removed from index, nothing deleted"]
+  sig["Ingest or refresh finds<br/>site-wide disallow or noindex"] --> sup2["suppressed with<br/>opt_out_type: site_wide_disallow or noindex"]
+  sup2 --> mon["Monthly suppression-recheck<br/>robots.txt only for site-wide disallow;<br/>entry page for noindex, only if robots.txt allows"]
+  mon -->|"signal gone"| flag["signal_cleared_at set<br/>no key removed, no ingest"]
+  flag --> adm["Admin: POST /v1/suppression/recheck"]
+  sup2 --> adm
+  sup --> adm
+  adm -->|"explicit_opt_out or takedown"| r409["409<br/>owner claim or admin key removal only"]
+  adm -->|"signal still present"| keep["stays suppressed,<br/>last_checked_at updated"]
+  adm -->|"signal gone"| ing["remove key, start ingest<br/>first activity re-checks signals"]
+  ing -->|"signal returns"| sup2
+  ing --> val["validating recomputes publication_status<br/>business_id kept"]
+  val -->|"passes"| pub["published, unverified listing,<br/>previously_suppressed warning"]
+  val -->|"does not pass"| drf["draft,<br/>previously_suppressed warning"]
+```
+
+### 16.5 Compliance controls
 
 | Control | Where enforced |
 |---|---|
 | robots.txt, crawl-delay, meta robots, `X-Robots-Tag` | Crawl activity, orchestration politeness |
-| Identified user agent + contact URL | `website` adapter config |
+| Self-describing user agent, `bot_info_url` page with `opt_out_contact`, same string on every fetch | `website` adapter config, config validation |
 | SSRF: block private, loopback, link-local, metadata IPs; re-check after redirects; size and time limits; http/https only | Every crawl activity |
-| Suppression list checked before any ingest step | First activity |
+| Suppression list and robots.txt checked before any ingest or refresh step | First activity |
+| Opt-out type recorded; re-check only for site-wide disallow and noindex, robots.txt-only for a disallowed site | `suppression_list`, re-check endpoint and Schedule |
+| Outcome metrics carry no business data | Metrics |
 | License: storable fields, TTL, attribution | Write guard, attribution in public-listings notice |
 | Search-provider terms | Provider checklist, `search_api_calls` audit |
 | Admin auth, Temporal UI never public | API, deployment |
@@ -1257,9 +1312,12 @@ flowchart LR
   end
   AGE --> calc["Per field: retrieved_at + max_age"]
   calc --> nra["businesses.next_refresh_at =<br/>earliest stale time,<br/>or last_verified_at + 14 days"]
-  nra --> scan["refresh-scan Schedule, daily,<br/>overlap skip, up to 50 per run,<br/>stale first, published first"]
+  nra --> scan["refresh-scan Schedule, daily,<br/>overlap skip, up to 50 per run,<br/>stale first, published first,<br/>skips suppressed records"]
   scan --> rw["refresh-business_id workflows"]
-  rw --> ing["Ingest pipeline with merge<br/>freshness override"]
+  rw --> chk{"First activity:<br/>opt-out check"}
+  chk -->|"new signal"| sup["suppressed, de-indexed,<br/>dropped from active sets"]
+  chk -->|"technical block"| tb["keep existing values,<br/>access_status = technical_block,<br/>ladder for stale or missing fields"]
+  chk -->|"clear"| ing["Ingest pipeline with merge<br/>freshness override,<br/>admin edits never overwritten"]
 
   calc --> stale{"Stale?"}
   stale -->|"yes"| eff1["Chat hedges: 'as of date, confirm by phone'"]
@@ -1498,12 +1556,17 @@ erDiagram
   }
   ingest_jobs {
     string job_id PK
+    string kind
+    boolean dry_run
     string url
     string place_id
     string discovery_id
     string host
     string business_id
     string status
+    string outcome
+    string opt_out_type
+    jsonb ladder_summary
     jsonb stage_timings
     jsonb warnings
     string error
@@ -1520,6 +1583,9 @@ erDiagram
     string key_type PK
     string key_value PK
     string reason
+    string opt_out_type
+    timestamp last_checked_at
+    timestamp signal_cleared_at
   }
   takedowns {
     string takedown_id PK
@@ -1577,6 +1643,8 @@ flowchart LR
     e4["Fallback-ladder evals"]
     e5["Durable-execution evals"]
     e6["Data store evals"]
+    e13["Opt-out and coverage evals:<br/>opt_out_type, outcome, re-check,<br/>refresh opt-out, user agent"]
+    e14["Coverage sample: 300+ sites,<br/>dry_run, before launch"]
   end
   subgraph G2E["G2 Search"]
     e7["Search evals: 50+ queries,<br/>nDCG@10, recall@30,<br/>null data stays as unknown"]
@@ -1602,11 +1670,11 @@ Each phase delivers part of a goal and ends with its evals passing (`§15`).
 
 ```mermaid
 flowchart LR
-  P1["Phase 1: Schemas + ingest<br/>Temporal, ingest workflow, profiles,<br/>adapter interface + license guard,<br/>website adapter, ladder steps 1, 3, 4,<br/>classifier, extractor, merger, normalizer,<br/>CLI ingest, generalization test<br/>→ G1 core"]
+  P1["Phase 1: Schemas + ingest<br/>Temporal, ingest workflow, profiles,<br/>adapter interface + license guard,<br/>website adapter, ladder steps 1, 3, 4,<br/>classifier, extractor, merger, normalizer,<br/>suppression list + first-activity opt-out check,<br/>POST /v1/suppression, bot info page,<br/>CLI ingest, generalization test,<br/>coverage sample<br/>→ G1 core"]
   P2["Phase 2: Chat<br/>prompt compiler, capability registry,<br/>tools, SSE single-business chat<br/>→ G3"]
   P3["Phase 3: Search + active set<br/>indexer, hybrid retrieval,<br/>service-area match, requirements,<br/>four-state evaluation, reranker, UI<br/>→ G2 + G4 base"]
   P4["Phase 4: Refine through conversation<br/>match state, chat-to-search,<br/>router, fan-out, comparison<br/>→ G4"]
-  P5["Phase 5: Discovery + compliance<br/>Places adapter, /discover,<br/>listing-only, publication states,<br/>takedown, suppression, leads,<br/>auth, rate limits, SSRF, refresh<br/>→ G1 complete, compliance"]
+  P5["Phase 5: Discovery + compliance<br/>Places adapter, /discover,<br/>listing-only, publication states,<br/>takedown, place_id + phone_norm keys,<br/>re-check endpoint + Schedule, leads,<br/>auth, rate limits, SSRF, refresh<br/>→ G1 complete, compliance"]
   P1 --> P2 --> P3 --> P4 --> P5
 ```
 
@@ -1626,7 +1694,7 @@ stateDiagram-v2
   verified --> unverified: admin verify false
 ```
 
-After verification an owner can edit their record with `owner_edit` provenance, publish a listing-only draft, opt an excluded site back in once the signal is gone, set `agent_status`, add `custom_instructions` below the guardrails, and receive held leads. A claim never changes `business_id`, and control of one location never grants control of its siblings.
+After verification an owner can edit their record with `owner_edit` provenance, publish a listing-only draft, clear an explicit opt-out (a site-wide disallow or noindex can already be cleared in v1 through the admin re-check, `§16.4`), set `agent_status`, add `custom_instructions` below the guardrails, and receive held leads. A claim never changes `business_id`, and control of one location never grants control of its siblings.
 
 ---
 
@@ -1634,7 +1702,8 @@ After verification an owner can edit their record with `owner_edit` provenance, 
 
 These are small mismatches in `SPEC.md` found while building the diagrams. They are not fixed here.
 
-1. **Appendix A core example vs §6.2.** The example record has `access_status: explicit_opt_out` and `publication_status: suppressed`, yet holds profile data, offers, guardrails, and phone. §6.2 says a record suppressed by an explicit opt-out or site-wide disallow holds only the host, `contact.website`, and the opt-out reason. Its warning message also says "noindex,nofollow", which is a different signal from an explicit opt-out.
+1. **Appendix A core example vs §6.2.** The example record has `access_status: opted_out` and `publication_status: suppressed`, yet holds profile data, offers, guardrails, and phone. §6.2 says a record suppressed by an explicit opt-out or site-wide disallow holds only the host, `contact.website`, and the opt-out reason. Its warning message also says "noindex,nofollow", which is a different signal from an explicit opt-out.
 2. **Appendix A profile summaries vs manifest example.** The restaurant summary says "Catalog path: `signature_items`", while the manifest example lists `catalog_paths: ["signature_items", "dietary_options"]`.
 3. **§14 repository layout** lists `adapters/ (website, places_api, open_data, search_api)` but not the `geocoder` adapter that §5 and §6.4 define.
 4. **§14 `/activities`** has no lead-delivery or takedown activities, although §6.5 runs both as Temporal workflows whose I/O must be in activities.
+5. **§14 `/workflows`** has no module for the `recheck-{host}` workflow or the `suppression-recheck` Schedule that §6.5 and §11 define, and `/api` has no module named for `POST /v1/suppression`.
